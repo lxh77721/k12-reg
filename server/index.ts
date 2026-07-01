@@ -117,6 +117,8 @@ const AUTH_BASE_URL = "https://auth.openai.com";
 const AUTH_EMAIL_OTP_SEND_URL = `${AUTH_BASE_URL}/api/accounts/email-otp/send`;
 const AUTH_CREATE_ACCOUNT_PASSWORD_URL = `${AUTH_BASE_URL}/create-account/password`;
 const AUTH_ABOUT_YOU_URL = `${AUTH_BASE_URL}/about-you`;
+const AUTH_WORKSPACE_URL = `${AUTH_BASE_URL}/workspace`;
+const AUTH_WORKSPACE_SELECT_URL = `${AUTH_BASE_URL}/api/accounts/workspace/select`;
 const AUTH_CHOOSE_ACCOUNT_URL = `${AUTH_BASE_URL}/choose-an-account`;
 const CODEX_CONSENT_URL = `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`;
 const DEFAULT_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
@@ -201,15 +203,18 @@ function decodeBase64UrlJson(value: string): unknown {
   return JSON.parse(Buffer.from(padded, "base64").toString("utf8")) as unknown;
 }
 
-function summarizeToken(token: string): {hash: string; preview: string; email: string; expiresAt: string} {
+function summarizeToken(token: string): {hash: string; preview: string; email: string; expiresAt: string; accountId: string; planType: string} {
   const payload = decodeJwtPayload(token);
   const profile = (payload["https://api.openai.com/profile"] || {}) as Record<string, unknown>;
+  const auth = (payload["https://api.openai.com/auth"] || {}) as Record<string, unknown>;
   const exp = Number(payload.exp || 0);
   return {
     hash: tokenHash(token),
     preview: tokenPreview(token),
     email: asString(profile.email || payload.email),
     expiresAt: exp > 0 ? new Date(exp * 1000).toISOString() : "",
+    accountId: asString(auth.chatgpt_account_id),
+    planType: asString(auth.chatgpt_plan_type),
   };
 }
 
@@ -795,6 +800,46 @@ async function completeAboutYou(client: any, task?: K12Task): Promise<string> {
   return String(payload.page?.payload?.url || payload.continue_url || "");
 }
 
+async function selectAuthWorkspace(client: any, task?: K12Task, referer = AUTH_WORKSPACE_URL): Promise<string> {
+  const workspaceIds = task ? targetK12WorkspaceIds(task) : appConfig.workspaceIds;
+  const candidates = Array.from(new Set([...workspaceIds, "default", "personal"].filter(Boolean)));
+  let lastError = "";
+
+  for (const workspaceId of candidates) {
+    if (task) appendLog(task, "info", `auth workspace/select: ${workspaceId}`);
+    const response = await client.fetch(AUTH_WORKSPACE_SELECT_URL, {
+      method: "POST",
+      headers: oauthBrowserHeaders(client, {
+        accept: "application/json",
+        "content-type": "application/json",
+        origin: AUTH_BASE_URL,
+        referer,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+      }),
+      body: JSON.stringify({workspace_id: workspaceId}),
+    });
+    const text = await response.text().catch(() => "");
+    if (!response.ok) {
+      lastError = `workspace_id=${workspaceId} HTTP ${response.status}: ${text.slice(0, 240)}`;
+      if (task) appendLog(task, "warn", lastError);
+      continue;
+    }
+    try {
+      const data = JSON.parse(text) as {continue_url?: string; page?: {payload?: {url?: string}}};
+      const nextUrl = String(data.page?.payload?.url || data.continue_url || "");
+      if (nextUrl) return new URL(nextUrl, AUTH_BASE_URL).toString();
+      lastError = `workspace_id=${workspaceId} 响应缺少 continue_url: ${text.slice(0, 240)}`;
+    } catch {
+      lastError = `workspace_id=${workspaceId} 非 JSON 响应: ${text.slice(0, 240)}`;
+    }
+    if (task) appendLog(task, "warn", lastError);
+  }
+
+  throw new Error(`auth workspace/select 失败: ${lastError || "unknown"}`);
+}
+
 async function continueAuthSteps(
   client: any,
   startUrl: string,
@@ -846,6 +891,12 @@ async function continueAuthSteps(
     if (continueUrl === AUTH_ABOUT_YOU_URL) {
       log("info", "首次登录要求填写基础资料");
       continueUrl = await completeAboutYou(client, task);
+      continue;
+    }
+
+    if (continueUrl === AUTH_WORKSPACE_URL || continueUrl.startsWith(`${AUTH_WORKSPACE_URL}?`)) {
+      log("info", "登录要求选择 workspace，优先选择配置的 K12 空间");
+      continueUrl = await selectAuthWorkspace(client, task, continueUrl);
       continue;
     }
 
@@ -910,6 +961,9 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
     } else if (isEmailOtpSendStepError(error)) {
       appendLog(task, "warn", "登录流程要求邮箱验证码，开始邮件接码");
       await continueAuthSteps(client, authStepFromError(error) || AUTH_EMAIL_OTP_SEND_URL, task, {finishChatGptCallback: true});
+    } else if (message.includes(AUTH_WORKSPACE_URL)) {
+      appendLog(task, "warn", "登录流程停在 workspace 选择页，自动选择 K12 空间");
+      await continueAuthSteps(client, AUTH_WORKSPACE_URL, task, {finishChatGptCallback: true});
     } else if (authStepFromError(error)) {
       appendLog(task, "warn", `接管 OpenAI auth step: ${authStepFromError(error)}`);
       await continueAuthSteps(client, authStepFromError(error), task, {finishChatGptCallback: true});
@@ -933,6 +987,11 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
         if (isEmailOtpSendStepError(retryError)) {
           appendLog(task, "warn", "重试后进入邮箱验证码流程，开始邮件接码");
           await continueAuthSteps(client, authStepFromError(retryError) || AUTH_EMAIL_OTP_SEND_URL, task, {finishChatGptCallback: true});
+          return String(await client.getChatGPTAccessToken());
+        }
+        if (String(retryError instanceof Error ? retryError.message : retryError).includes(AUTH_WORKSPACE_URL)) {
+          appendLog(task, "warn", "重试后停在 workspace 选择页，自动选择 K12 空间");
+          await continueAuthSteps(client, AUTH_WORKSPACE_URL, task, {finishChatGptCallback: true});
           return String(await client.getChatGPTAccessToken());
         }
         if (authStepFromError(retryError)) {
@@ -962,7 +1021,60 @@ function recordAccessToken(task: K12Task, email: EmailRecord, accessToken: strin
   task.accessTokenEmail = tokenInfo.email || email.email;
   task.accessTokenExpiresAt = tokenInfo.expiresAt;
   email.lastAccessTokenHash = tokenInfo.hash;
-  appendLog(task, "ok", `AT 获取成功: ${tokenInfo.preview}`);
+  appendLog(task, "ok", `AT 获取成功: ${tokenInfo.preview} plan=${tokenInfo.planType || "?"} account=${tokenInfo.accountId ? tokenInfo.accountId.slice(0, 8) : "?"}`);
+}
+
+function normalizeChatGptUserId(auth: Record<string, unknown>): string {
+  const direct = asString(auth.chatgpt_user_id || auth.user_id);
+  if (direct) return direct;
+  const accountUserId = asString(auth.chatgpt_account_user_id);
+  return accountUserId.includes("__") ? accountUserId.split("__")[0] : accountUserId;
+}
+
+function targetK12WorkspaceIds(task: K12Task): string[] {
+  return Array.from(new Set((task.workspaceIds.length ? task.workspaceIds : appConfig.workspaceIds)
+    .map((item) => item.trim())
+    .filter(Boolean)));
+}
+
+function isK12AccessToken(accessToken: string, task: K12Task): boolean {
+  const tokenInfo = summarizeToken(accessToken);
+  const plan = tokenInfo.planType.toLowerCase();
+  const targetIds = new Set(targetK12WorkspaceIds(task).map((item) => item.toLowerCase()));
+  return plan === "k12" || (!!tokenInfo.accountId && targetIds.has(tokenInfo.accountId.toLowerCase()));
+}
+
+function describeAccessTokenContext(accessToken: string): string {
+  const tokenInfo = summarizeToken(accessToken);
+  return `plan=${tokenInfo.planType || "?"} account=${tokenInfo.accountId || "?"} email=${tokenInfo.email || "?"}`;
+}
+
+async function readChatGptSessionAccessToken(client: any, task: K12Task, reason: string): Promise<string> {
+  appendLog(task, "info", `重新读取 ChatGPT Web AT: ${reason}`);
+  const token = String(await client.getChatGPTAccessToken());
+  appendLog(task, "info", `当前 Web AT 上下文: ${describeAccessTokenContext(token)}`);
+  return token;
+}
+
+async function ensureK12AccessTokenForNoRt(client: any, task: K12Task, accessToken: string): Promise<string> {
+  if (isK12AccessToken(accessToken, task)) return accessToken;
+
+  appendLog(task, "warn", `当前 AT 不是 K12 上下文，不能直接 noRT 入库: ${describeAccessTokenContext(accessToken)}`);
+  let latestToken = accessToken;
+  for (const workspaceId of targetK12WorkspaceIds(task)) {
+    const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
+    task.workspaceResults.push(result);
+    await persistTasks();
+    if (!result.ok) continue;
+    latestToken = await readChatGptSessionAccessToken(client, task, `K12 ${workspaceId.slice(0, 8)}... ${task.route} 成功后`);
+    if (isK12AccessToken(latestToken, task)) return latestToken;
+    appendLog(task, "warn", `K12 请求成功后 session AT 仍不是 K12: ${describeAccessTokenContext(latestToken)}`);
+  }
+
+  throw new Error(
+    `noRT fallback 需要 K12 workspace AT，但当前仍是 ${describeAccessTokenContext(latestToken)}。` +
+    "说明邮箱登录后停在个人/free 账户，未切到 K12 团队 token，已阻止导入不可用账号。",
+  );
 }
 
 function buildSub2ApiCredentialsFromAccessToken(accessToken: string, fallbackEmail: string): Record<string, unknown> {
@@ -973,7 +1085,7 @@ function buildSub2ApiCredentialsFromAccessToken(accessToken: string, fallbackEma
     access_token: accessToken,
     email: asString(profile.email || payload.email, fallbackEmail),
     chatgpt_account_id: asString(auth.chatgpt_account_id),
-    chatgpt_user_id: asString(auth.chatgpt_account_user_id || auth.chatgpt_user_id || auth.user_id),
+    chatgpt_user_id: normalizeChatGptUserId(auth),
     plan_type: asString(auth.chatgpt_plan_type),
     client_id: asString(payload.client_id, "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"),
   };
@@ -1581,12 +1693,15 @@ async function runTask(task: K12Task): Promise<void> {
         }
       } catch (error) {
         if (!isAddPhoneFlowError(error)) throw error;
-        appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，改用 Web AT 创建 noRT 账号");
+        appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
         if (!accessToken) {
           accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
           recordAccessToken(task, email, accessToken);
           await appendTokenOut(accessToken);
         }
+        accessToken = await ensureK12AccessTokenForNoRt(client, task, accessToken);
+        recordAccessToken(task, email, accessToken);
+        await appendTokenOut(accessToken);
         const accountName = await createSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
         task.sub2apiAccount = accountName;
         email.sub2apiAccount = accountName;
@@ -1598,6 +1713,7 @@ async function runTask(task: K12Task): Promise<void> {
         throw new Error("K12 空间执行需要 AT：请启用 Sub2API OAuth，或先建立 ChatGPT Web session 后从 /api/auth/session 获取 accessToken");
       }
       for (const workspaceId of task.workspaceIds) {
+        if (task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route)) continue;
         const result = await sendK12Invite(task, client, accessToken, workspaceId, task.route);
         task.workspaceResults.push(result);
         await persistTasks();
