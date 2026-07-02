@@ -2276,12 +2276,15 @@ function scheduleTasks(): void {
   }
 }
 
-function createTasks(body: Record<string, unknown>): K12Task[] {
+function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippedRunning: number; missing: number} {
   const requestedEmailIds = Array.isArray(body.emailIds)
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
     : [];
+  const requested = new Set(requestedEmailIds);
+  const existingIds = new Set(emails.map((item) => item.id));
+  const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
   const selectedEmails = requestedEmailIds.length
-    ? emails.filter((item) => requestedEmailIds.includes(item.id))
+    ? emails.filter((item) => requested.has(item.id))
     : emails.filter((item) => item.status === "free");
   const limit = asNumber(body.count, selectedEmails.length || 1, 1, 500);
   const workspaceIds = parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : appConfig.workspaceIds;
@@ -2290,8 +2293,13 @@ function createTasks(body: Record<string, unknown>): K12Task[] {
   const runSub2Api = asBoolean(body.runSub2Api, appConfig.runSub2Api);
   const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
   const created: K12Task[] = [];
+  let skippedRunning = 0;
 
   for (const email of selectedEmails.slice(0, limit)) {
+    if (email.status === "running" || hasActiveTask(email.id)) {
+      skippedRunning += 1;
+      continue;
+    }
     const task: K12Task = {
       id: `k12_${Date.now()}_${randomUUID().slice(0, 8)}`,
       emailId: email.id,
@@ -2315,7 +2323,7 @@ function createTasks(body: Record<string, unknown>): K12Task[] {
   }
   void Promise.all([persistTasks(), persistEmails()]);
   scheduleTasks();
-  return created;
+  return {created, skippedRunning, missing};
 }
 
 function retryTask(source: K12Task): K12Task {
@@ -2609,8 +2617,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     if (body.concurrency !== undefined) {
       await saveConfig(normalizeConfig({...appConfig, taskConcurrency: asNumber(body.concurrency, appConfig.taskConcurrency, 1, 10)}));
     }
-    const created = createTasks(body).map(publicTask);
-    sendJson(res, 201, {tasks: created});
+    const result = createTasks(body);
+    sendJson(res, 201, {
+      tasks: result.created.map(publicTask),
+      skippedRunning: result.skippedRunning,
+      missing: result.missing,
+    });
     return;
   }
 

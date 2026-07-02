@@ -293,6 +293,12 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                 <span>每个分裂</span>
                 <input v-model.number="splitAliasCount" type="number" min="1" max="50" />
               </label>
+              <button class="ghost small" :disabled="!selectableParentEmails.length" @click="selectParentEmails">
+                只选母邮箱 {{ selectableParentEmails.length }}
+              </button>
+              <button class="primary small" :disabled="!selectedRunnableEmailIds.length" @click="startSelectedEmailTasks">
+                启动选中 {{ selectedRunnableEmailIds.length }}
+              </button>
               <button class="ghost small" :disabled="!selectedEmailIds.length" @click="splitSelectedEmails">
                 分裂选中 x{{ splitAliasCount || 4 }}
               </button>
@@ -526,6 +532,10 @@ const form = reactive({
 const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 0);
 const workspaceCount = computed(() => parseWorkspaceIds(workspaceText.value).length);
 const selectedReadyCount = computed(() => Math.min(Math.max(1, Number(runCount.value) || 1), emails.value.filter((item) => item.status === "free").length));
+const selectedRunnableEmailIds = computed(() => emails.value
+  .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running")
+  .map((item) => item.id));
+const selectableParentEmails = computed(() => emails.value.filter((item) => !item.parentEmail && item.status !== "running"));
 const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
 const deletableEmails = computed(() => emails.value.filter((item) => item.status !== "running"));
 const allVisibleEmailsSelected = computed(() => deletableEmails.value.length > 0 && deletableEmails.value.every((item) => selectedEmailIds.value.includes(item.id)));
@@ -716,6 +726,11 @@ function toggleAllEmails(event: Event) {
   selectedEmailIds.value = checked ? deletableEmails.value.map((item) => item.id) : [];
 }
 
+function selectParentEmails() {
+  selectedEmailIds.value = selectableParentEmails.value.map((item) => item.id);
+  showToast(`已选择母邮箱 ${selectedEmailIds.value.length} 个`);
+}
+
 async function splitSelectedEmails() {
   if (!selectedEmailIds.value.length) return;
   const count = Math.max(1, Math.min(50, Number(splitAliasCount.value) || 4));
@@ -762,6 +777,33 @@ async function deleteEmailsByStatus(status: "free" | "failed" | "success") {
   });
   selectedEmailIds.value = [];
   showToast(`删除${label}邮箱完成：删除 ${result.removed ?? 0} 个`);
+  await refreshAll();
+}
+
+async function startSelectedEmailTasks() {
+  const emailIds = selectedRunnableEmailIds.value;
+  if (!emailIds.length) {
+    showToast("请选择非运行中的邮箱");
+    return;
+  }
+  const saved = await saveConfig();
+  if (!saved) return;
+  const data = await api<any>("/api/tasks", {
+    method: "POST",
+    body: JSON.stringify({
+      emailIds,
+      count: emailIds.length,
+      concurrency: form.taskConcurrency,
+      workspaceIds: parseWorkspaceIds(workspaceText.value),
+      route: form.route,
+      runWorkspaceJoin: form.runWorkspaceJoin,
+      runSub2Api: form.runSub2Api,
+      sub2apiGroupName: form.sub2apiGroupName || "k12",
+    }),
+  });
+  selectedEmailIds.value = [];
+  const skipped = Number(data.skippedRunning || 0) + Number(data.missing || 0);
+  showToast(`已用选中邮箱创建 ${data.tasks?.length || 0} 个任务${skipped ? `，跳过 ${skipped} 个` : ""}`);
   await refreshAll();
 }
 

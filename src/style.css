@@ -945,6 +945,50 @@ tbody tr:last-child td {
   margin: 0;
 }
 
+.email-pool-modal .section-head {
+  gap: 14px;
+}
+
+.email-pool-modal .modal-actions {
+  max-width: 680px;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
+.email-pool-modal .modal-actions button.small {
+  min-height: 28px;
+  padding: 5px 9px;
+  border-radius: 12px;
+  font-size: 11px;
+  box-shadow: none;
+}
+
+.email-pool-modal .modal-actions button:hover:not(:disabled) {
+  box-shadow: none;
+}
+
+.email-pool-modal .modal-actions button.danger {
+  border-color: rgba(251, 113, 133, 0.32);
+  background: rgba(251, 113, 133, 0.08);
+}
+
+.email-pool-modal .split-count-field {
+  width: 84px;
+  gap: 3px;
+}
+
+.email-pool-modal .split-count-field span {
+  font-size: 10px;
+}
+
+.email-pool-modal .split-count-field input {
+  min-height: 28px;
+  padding: 5px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+}
+
 .modal-body {
   min-height: 0;
   overflow: auto;
