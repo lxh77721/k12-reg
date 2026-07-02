@@ -1,0 +1,30 @@
+{
+  "name": "codex-register",
+  "version": "1.0.7",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "web": "tsx src/web-server.ts",
+    "build": "tsup --config tsup.config.ts",
+    "start": "node bundle/index.cjs",
+    "check": "node bundle/check-auth-quota.cjs",
+    "check:cpa": "node bundle/check-auth-quota.cjs --cpa",
+    "batch": "node bundle/batch-register.cjs"
+  },
+  "dependencies": {
+    "chromium-bidi": "^15.0.0",
+    "fetch-cookie": "^3.1.0",
+    "imapflow": "^1.3.3",
+    "playwright-core": "^1.59.1",
+    "socks": "^2.8.7",
+    "tough-cookie": "^5.1.1",
+    "undici": "^7.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.2"
+  }
+}

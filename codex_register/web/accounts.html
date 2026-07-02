@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账户台账</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app accounts-app">
+    <header class="topbar shellbar">
+      <div class="title">
+        <div class="eyebrow">Account Ledger</div>
+        <h1>账户台账</h1>
+        <p>统一查看手机号、AT、Plus、绑定邮箱、SUB2API/CPA 入库结果。</p>
+      </div>
+      <nav class="nav">
+        <button class="nav-ai" type="button" data-agent-open>AI 接入</button>
+        <a href="/">首页</a>
+        <a class="active" href="/accounts">账户台账</a>
+        <a href="/register">手机号注册</a>
+        <a href="/plus">AT 升级</a>
+        <a href="/oa">OA 接入</a>
+        <button class="ghost" type="button" data-theme-toggle>白天</button>
+      </nav>
+    </header>
+
+    <section class="accounts-grid">
+      <section class="card accounts-main">
+        <div class="section-head">
+          <div>
+            <h2>账号生命周期</h2>
+            <p class="muted">如果列表为空，先点“历史补账”把旧任务和 AT 池关联进来。</p>
+          </div>
+          <div class="row">
+            <input id="account-filter" class="search-input" placeholder="搜索手机号 / 邮箱 / token hash / 账号">
+            <button id="reconcile" class="small" type="button">历史补账</button>
+            <button id="refresh" class="primary small" type="button">刷新</button>
+          </div>
+        </div>
+        <div id="account-summary" class="stat-grid compact"></div>
+        <div class="account-toolbar">
+          <div id="account-type-filter" class="task-filter account-type-filter" aria-label="账户类型筛选"></div>
+        </div>
+        <div class="table-wrap clean accounts-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>手机号</th>
+                <th>AT</th>
+                <th>Plus</th>
+                <th>绑定邮箱</th>
+                <th>OA</th>
+                <th>更新时间</th>
+              </tr>
+            </thead>
+            <tbody id="accounts"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="card accounts-side">
+        <div class="section-head">
+          <div>
+            <h2>一键流程</h2>
+            <p class="muted">注册手机号 -> Plus 升级 -> OA 接入。</p>
+          </div>
+          <button id="refresh-workflows" class="small" type="button">刷新</button>
+        </div>
+        <form id="workflow-form" class="stack-form">
+          <div class="field">
+            <label for="target">OA 目标</label>
+            <select id="target" name="target">
+              <option value="sub2api" selected>SUB2API</option>
+              <option value="cpa">CPA</option>
+            </select>
+          </div>
+          <label class="check-row">
+            <input id="plus" name="plus" type="checkbox" checked>
+            <span>包含 Plus 升级</span>
+          </label>
+          <div class="field">
+            <label for="paypalPhone">PayPal 手机</label>
+            <input id="paypalPhone" name="paypalPhone" placeholder="08012345678">
+          </div>
+          <div class="split">
+            <div class="field">
+              <label for="concurrency">并发</label>
+              <input id="concurrency" name="concurrency" type="number" min="1" max="20" value="1">
+            </div>
+            <div class="field">
+              <label for="removeTokenOnSuccess">成功移除 AT</label>
+              <select id="removeTokenOnSuccess" name="removeTokenOnSuccess">
+                <option value="false" selected>否</option>
+                <option value="true">是</option>
+              </select>
+            </div>
+          </div>
+          <button class="primary wide" type="submit">启动一键流程</button>
+        </form>
+
+        <div class="section-head mini-head">
+          <div>
+            <h2>Workflow</h2>
+            <p class="muted">等待 OTP 时可在详情里复制 runId，用 API 提交。</p>
+          </div>
+        </div>
+        <div id="workflows" class="workflow-list"></div>
+      </aside>
+    </section>
+  </main>
+
+  <div id="account-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card account-modal-card">
+      <div class="modal-head">
+        <h2>账户详情</h2>
+        <button id="close-modal" class="ghost" type="button">关闭</button>
+      </div>
+      <pre id="account-detail" class="detail-pre"></pre>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/agent.js"></script>
+  <script src="/accounts.js"></script>
+</body>
+</html>

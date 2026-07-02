@@ -3,3 +3,7 @@ dist/
 data/
 config.json
 *.log
+pool_tokens.txt
+auth/
+**/._*
+*.bak.*

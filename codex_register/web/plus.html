@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AT 升级 Plus</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar shellbar">
+      <div class="title">
+        <div class="eyebrow">Plus Workspace</div>
+        <h1>AT 升级 Plus</h1>
+        <p>左侧管理 AT 池，中间跟踪升级任务，右侧用选中的 AT 创建任务。</p>
+      </div>
+      <nav class="nav">
+        <button class="nav-ai" type="button" data-agent-open>AI 接入</button>
+        <a href="/">首页</a>
+        <a href="/accounts">账户台账</a>
+        <a href="/register">手机号注册</a>
+        <a class="active" href="/plus">AT 升级</a>
+        <a href="/oa">OA 接入</a>
+        <button class="ghost" type="button" data-theme-toggle>白天</button>
+      </nav>
+    </header>
+
+    <section class="plus-workbench">
+      <aside class="card panel-left">
+        <div class="section-head">
+          <div>
+            <h2>AT 账号池</h2>
+            <p class="muted">选择一个或多个 AT 后创建升级任务。</p>
+          </div>
+          <button id="open-import" class="primary small" type="button">导入</button>
+        </div>
+
+        <div class="stat-grid compact">
+          <div class="stat"><div class="label">AT</div><div id="at-count" class="value">0</div></div>
+          <div class="stat"><div class="label">选中</div><div id="selected-count" class="value">0</div></div>
+        </div>
+
+        <div class="row toolbar">
+          <button id="open-at-list" class="small" type="button">查看/复制 AT</button>
+          <button id="reload-ats" class="small" type="button">刷新</button>
+          <button id="check-selected" class="small" type="button">检测试用</button>
+          <button id="delete-selected" class="danger small" type="button">删除</button>
+        </div>
+
+        <div id="check-progress" class="check-progress hidden"></div>
+        <div id="ats" class="at-list"></div>
+
+        <div class="config-strip">
+          <div class="muted">TOKEN FILE</div>
+          <div id="token-file" class="mono wrap"></div>
+        </div>
+      </aside>
+
+      <section class="card panel-main">
+        <div class="section-head">
+          <div>
+            <h2>升级任务列表</h2>
+            <p class="muted">点击任务打开详情弹窗，支持 OTP 提交和删除。</p>
+          </div>
+          <div class="row">
+            <span id="account" class="badge">PPXY 账户加载中</span>
+            <button id="refresh-jobs" class="small" type="button">刷新</button>
+          </div>
+        </div>
+
+        <div class="table-wrap clean">
+          <table>
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>任务</th>
+                <th>PayPal 手机</th>
+                <th>AT</th>
+                <th>结果</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="jobs"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="card panel-right">
+        <h2>创建升级任务</h2>
+        <p class="muted">会对左侧选中的每个 AT 分别创建任务。</p>
+        <form id="job-form">
+          <div class="field">
+            <label for="paypalPhone">PayPal 手机号</label>
+            <input id="paypalPhone" name="paypalPhone" placeholder="08012345678" required>
+          </div>
+          <div class="field">
+            <label for="clientRef">订单号 / 备注</label>
+            <input id="clientRef" name="clientRef" placeholder="默认自动生成">
+          </div>
+          <div class="field">
+            <label for="smsApi">接码 API</label>
+            <input id="smsApi" name="smsApi" placeholder="可选，https://...">
+          </div>
+          <div class="field">
+            <label for="otp">已知 OTP</label>
+            <input id="otp" name="otp" placeholder="可选，123456">
+          </div>
+          <div class="field">
+            <label for="proxyJp">JP 代理</label>
+            <input id="proxyJp" name="proxyJp" placeholder="默认读取 ppxy-env.cmd">
+          </div>
+          <label class="check-row">
+            <input id="removeTokenOnSuccess" name="removeTokenOnSuccess" type="checkbox">
+            <span>成功后从 AT 池移除</span>
+          </label>
+          <div class="form-cache-row">
+            <span id="plus-draft-status" class="muted">常用填写项会自动缓存</span>
+            <button id="clear-plus-draft" class="ghost small" type="button">清空缓存</button>
+          </div>
+          <button class="primary wide" type="submit">拿选中 AT 去升级</button>
+        </form>
+
+        <div class="config-strip">
+          <div class="muted">PPXY CONFIG</div>
+          <pre id="ppxy-config"></pre>
+        </div>
+      </aside>
+    </section>
+
+    <div id="import-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-backdrop" data-close-import></div>
+      <div class="modal-panel modal-narrow">
+        <div class="modal-head">
+          <div>
+            <h2>导入 AT</h2>
+            <p class="muted">支持多行、逗号分隔，或者直接粘贴日志文本。</p>
+          </div>
+          <button class="ghost icon-btn" type="button" data-close-import>×</button>
+        </div>
+        <div class="modal-body">
+          <textarea id="import-text" class="large-textarea" placeholder="eyJ...&#10;eyJ..."></textarea>
+          <div class="row spread">
+            <span class="muted">重复 AT 会自动跳过。</span>
+            <button id="import-btn" class="primary" type="button">确认导入</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="at-list-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-backdrop" data-close-at-list></div>
+      <div class="modal-panel modal-at-list">
+        <div class="modal-head">
+          <div>
+            <h2>AT 完整列表</h2>
+            <p class="muted">逐条查看完整 AT，可单独复制，也可一键复制全部。</p>
+          </div>
+          <div class="row">
+            <span class="badge">AT <span id="at-full-count">0</span></span>
+            <button id="copy-all-ats" class="small" type="button">复制全部</button>
+            <button class="ghost icon-btn" type="button" data-close-at-list>脳</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <div class="config-strip compact-strip">
+            <div class="muted">TOKEN FILE</div>
+            <div id="at-full-token-file" class="mono wrap"></div>
+          </div>
+          <div id="at-full-list" class="at-full-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="job-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-backdrop" data-close-job></div>
+      <div class="modal-panel">
+        <div class="modal-head">
+          <div>
+            <h2 id="job-modal-title">任务详情</h2>
+            <p id="job-modal-subtitle" class="muted"></p>
+          </div>
+          <button class="ghost icon-btn" type="button" data-close-job>×</button>
+        </div>
+        <pre id="job-detail" class="logbox modal-log"></pre>
+      </div>
+    </div>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/agent.js"></script>
+  <script src="/plus.js"></script>
+</body>
+</html>

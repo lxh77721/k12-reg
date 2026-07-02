@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>手机号注册账号</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar shellbar">
+      <div class="title">
+        <div class="eyebrow">Register Workspace</div>
+        <h1>手机号注册账号流程</h1>
+        <p>调用现有 <span class="mono">src/index.ts --phone --at --st</span> 流程，成功后写入 AT 池。</p>
+      </div>
+      <nav class="nav">
+        <button class="nav-ai" type="button" data-agent-open>AI 接入</button>
+        <a href="/">首页</a>
+        <a href="/accounts">账户台账</a>
+        <a class="active" href="/register">手机号注册</a>
+        <a href="/plus">AT 升级</a>
+        <a href="/oa">OA 接入</a>
+        <button class="ghost" type="button" data-theme-toggle>白天</button>
+      </nav>
+    </header>
+
+    <section class="grid register-layout">
+      <aside class="card control-card">
+        <div class="card-title-row">
+          <h2>开启注册任务</h2>
+          <button id="open-settings" class="ghost icon-btn settings-card-btn" type="button" aria-label="打开配置">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 8.25a3.75 3.75 0 1 0 0 7.5 3.75 3.75 0 0 0 0-7.5Zm0 5.8a2.05 2.05 0 1 1 0-4.1 2.05 2.05 0 0 1 0 4.1Z"/>
+              <path d="M20.25 12.72v-1.44l-2.07-.36a6.93 6.93 0 0 0-.58-1.4l1.2-1.72-1.02-1.02-1.72 1.2c-.44-.24-.9-.43-1.4-.58l-.36-2.07h-1.44l-.36 2.07c-.5.15-.96.34-1.4.58l-1.72-1.2L8.36 7.8l1.2 1.72c-.24.44-.43.9-.58 1.4l-2.07.36v1.44l2.07.36c.15.5.34.96.58 1.4l-1.2 1.72 1.02 1.02 1.72-1.2c.44.24.9.43 1.4.58l.36 2.07h1.44l.36-2.07c.5-.15.96-.34 1.4-.58l1.72 1.2 1.02-1.02-1.2-1.72c.24-.44.43-.9.58-1.4l2.07-.36Z"/>
+            </svg>
+          </button>
+        </div>
+        <form id="start-form">
+          <div class="split">
+            <div class="field">
+              <label for="count">注册数量</label>
+              <input id="count" name="count" type="number" min="1" max="100" value="10">
+            </div>
+            <div class="field">
+              <label for="concurrency">并发</label>
+              <input id="concurrency" name="concurrency" type="number" min="1" max="20" value="10">
+            </div>
+          </div>
+          <div class="field">
+            <label for="tokenOut">AT 输出文件</label>
+            <input id="tokenOut" name="tokenOut" placeholder="默认读取 ppxy-env.cmd 的 TOKEN_FILE">
+            <div class="free-flow-box">
+              <label class="check-row">
+                <input id="freeFlowMode" name="freeFlowMode" type="checkbox">
+                <span>完全 free 流程：注册成功后直接 OA/SUB2API</span>
+              </label>
+              <div class="hint">开启后会跳过 AT 升级 Plus；成功注册后继续绑定邮箱并导入 SUB2API，账户台账状态记为 free。</div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="register-password-preview">账号默认密码</label>
+            <div class="password-preview">
+              <input id="register-password-preview" type="password" value="********" readonly disabled>
+              <button id="open-password-modal" class="small" type="button">查看/复制</button>
+            </div>
+            <div id="register-password-status" class="hint">默认隐藏，点击后弹窗查看。</div>
+          </div>
+          <div class="field">
+            <label for="sentinelBrowserProxy">Sentinel 浏览器代理（可选）</label>
+            <input id="sentinelBrowserProxy" name="sentinelBrowserProxy" placeholder="http://user:pass@host:port">
+          </div>
+          <div class="field">
+            <label for="sentinelBrowserPath">浏览器路径（可选）</label>
+            <input id="sentinelBrowserPath" name="sentinelBrowserPath" placeholder="C:\Program Files\Google\Chrome\Application\chrome.exe">
+          </div>
+          <button class="primary wide" type="submit">开启注册</button>
+        </form>
+
+        <div class="agent-register-box">
+          <div class="card-title-row compact">
+            <div>
+              <h3>&#33258;&#21160;&#34917;&#20301;&#27880;&#20876;</h3>
+              <p class="muted">&#30446;&#26631;&#25104;&#21151; N &#20010;&#65292;&#22833;&#36133;&#21518;&#33258;&#21160;&#34917;&#20219;&#21153;&#65292;&#30452;&#21040;&#36798;&#21040;&#30446;&#26631;&#25110;&#26368;&#22823;&#23581;&#35797;&#25968;&#12290;</p>
+            </div>
+          </div>
+          <form id="auto-register-form">
+            <div class="split">
+              <div class="field"><label for="auto-target-success">&#30446;&#26631;&#25104;&#21151;</label><input id="auto-target-success" name="targetSuccess" type="number" min="1" max="100" value="10"></div>
+              <div class="field"><label for="auto-max-attempts">&#26368;&#22810;&#23581;&#35797;</label><input id="auto-max-attempts" name="maxAttempts" type="number" min="1" max="300" value="30"></div>
+            </div>
+            <div class="split">
+              <div class="field"><label for="auto-initial-count">&#39318;&#25209;&#25968;&#37327;</label><input id="auto-initial-count" name="count" type="number" min="1" max="100" value="10"></div>
+              <div class="field"><label for="auto-concurrency">&#24182;&#21457;</label><input id="auto-concurrency" name="concurrency" type="number" min="1" max="20" value="10"></div>
+            </div>
+            <div class="free-flow-box">
+              <label class="check-row">
+                <input id="autoFreeFlowMode" name="freeFlowMode" type="checkbox">
+                <span>&#23436;&#20840; free &#33258;&#21160;&#34917;&#20301;&#65306;&#27880;&#20876;&#25104;&#21151;&#21518;&#30452;&#25509; OA/SUB2API</span>
+              </label>
+              <div class="hint">&#24320;&#21551;&#21518;&#30446;&#26631;&#25353; free &#23436;&#25104;&#25968;&#35745;&#31639;&#65292;&#22833;&#36133;&#20250;&#32487;&#32493;&#34917;&#20301;&#65292;&#30452;&#21040;&#36798;&#26631;&#25110;&#21040;&#36798;&#26368;&#22823;&#23581;&#35797;&#25968;&#12290;</div>
+            </div>
+
+            <button class="primary wide" type="submit">&#24320;&#21551;&#33258;&#21160;&#34917;&#20301;</button>
+          </form>
+        </div>
+      </aside>
+
+      <section class="card list-card">
+        <div class="section-head">
+          <div>
+            <h2>注册任务列表</h2>
+            <p class="muted task-list-hint">
+              <span>任务名会在取到号码后变成：号码_provider_唯一标识。</span>
+              <span class="success-inline">
+                成功结果 txt：
+                <code id="success-file-path">加载中...</code>
+                <small id="success-task-count">-</small>
+              </span>
+            </p>
+          </div>
+          <div class="row">
+            <span id="summary" class="badge">加载中</span>
+            <button id="refresh" class="small" type="button">刷新</button>
+            <button id="delete-failed" class="danger small" type="button" disabled>删除失败(0)</button>
+            <button id="delete-finished" class="danger small" type="button" disabled>删除失败/取消(0)</button>
+          </div>
+        </div>
+        <div id="success-summary" class="success-summary">
+          <div class="success-summary-main">
+            <div class="summary-pill">
+              <span>成功手机号</span>
+              <strong id="success-phone-count">0</strong>
+            </div>
+            <div class="summary-pill">
+              <span>AT 数量</span>
+              <strong id="success-token-count">0</strong>
+            </div>
+            <div class="summary-pill">
+              <span>接码成本</span>
+              <strong id="sms-cost-total">$0.0000</strong>
+            </div>
+            <div id="sms-balance-bar" class="summary-balance-list" aria-live="polite"></div>
+          </div>
+          <div class="summary-bottom-row">
+            <div class="summary-filter-inline">
+              <div id="task-status-filter" class="task-filter" role="tablist" aria-label="任务状态筛选">
+                <button class="active" type="button" data-task-filter="all">全部 <b>0</b></button>
+                <button type="button" data-task-filter="running">运行中 <b>0</b></button>
+                <button type="button" data-task-filter="failed">失败 <b>0</b></button>
+                <button type="button" data-task-filter="success">成功 <b>0</b></button>
+              </div>
+            </div>
+            <div class="row success-actions">
+              <button id="copy-success-path" class="small" type="button" disabled>复制路径</button>
+              <button id="export-success" class="primary small" type="button" disabled>导出成功 txt</button>
+            </div>
+          </div>
+        </div>
+        <div class="register-view-tabs" role="tablist" aria-label="register task views">
+          <button class="active" type="button" data-register-view="tasks">&#21407;&#20219;&#21153;&#21015;&#34920;</button>
+          <button type="button" data-register-view="batches">&#25209;&#27425; / Agent &#35270;&#22270;</button>
+        </div>
+        <div id="agent-dashboard" class="agent-dashboard view-panel hidden" data-view-panel="batches">
+          <div class="agent-summary-grid">
+            <div class="agent-stat"><span>&#27880;&#20876;&#36816;&#34892;</span><strong id="agent-register-running">-</strong></div>
+            <div class="agent-stat"><span>&#20170;&#26085;&#25104;&#21151;</span><strong id="agent-register-success-today">-</strong></div>
+            <div class="agent-stat"><span>AT &#21487; Plus</span><strong id="agent-at-plus">-</strong></div>
+            <div class="agent-stat"><span>OA &#21487;&#29992;&#37038;&#31665;</span><strong id="agent-oa-emails">-</strong></div>
+            <div class="agent-stat"><span>Plus OTP</span><strong id="agent-plus-otp">-</strong></div>
+          </div>
+          <div class="batch-panel">
+            <div class="section-head compact-head">
+              <div>
+                <h3>&#27880;&#20876;&#25209;&#27425;</h3>
+                <p class="muted">&#27599;&#27425;&#24320;&#21551;&#27880;&#20876;&#20250;&#29983;&#25104;&#19968;&#20010; batchId&#65307;&#33258;&#21160;&#34917;&#20301;&#20063;&#20250;&#24402;&#21040;&#21516;&#19968;&#25209;&#27425;&#12290;</p>
+              </div>
+              <div class="row">
+                <button id="cleanup-failed-dryrun" class="small" type="button">&#39044;&#35272;&#28165;&#29702;&#22833;&#36133;</button>
+                <button id="cleanup-failed-now" class="danger small" type="button">&#28165;&#29702;&#22833;&#36133;</button>
+              </div>
+            </div>
+            <div id="batch-list" class="batch-list"></div>
+          </div>
+        </div>
+        <div class="table-wrap clean view-panel" data-view-panel="tasks">
+          <table>
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>任务信息</th>
+                <th>手机号</th>
+                <th>AT</th>
+                <th>时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="tasks"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <div id="log-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-backdrop" data-close-modal></div>
+      <div class="modal-panel">
+        <div class="modal-head">
+          <div>
+            <h2 id="modal-title">任务日志</h2>
+            <p id="modal-subtitle" class="muted"></p>
+          </div>
+          <button class="ghost icon-btn" type="button" data-close-modal>×</button>
+        </div>
+        <pre id="logs" class="logbox modal-log"></pre>
+      </div>
+    </div>
+
+    <div id="batch-task-modal" class="modal hidden" role="dialog" aria-modal="true">
+
+      <div class="modal-backdrop" data-close-batch-task></div>
+
+      <div class="modal-panel batch-task-modal-panel">
+
+        <div class="modal-head">
+
+          <div>
+
+            <h2 id="batch-task-modal-title">批次任务</h2>
+
+            <p id="batch-task-modal-subtitle" class="muted"></p>
+
+          </div>
+
+          <div class="row">
+            <button id="batch-task-cancel" class="danger small" type="button">取消批次</button>
+            <button class="ghost icon-btn" type="button" data-close-batch-task>×</button>
+          </div>
+
+        </div>
+
+        <div class="batch-task-modal-body">
+
+          <div class="table-wrap clean batch-task-table-wrap">
+
+            <table>
+
+              <thead>
+
+                <tr>
+
+                  <th>状态</th>
+
+                  <th>任务信息</th>
+
+                  <th>手机号</th>
+
+                  <th>AT</th>
+
+                  <th>时间</th>
+
+                  <th>操作</th>
+
+                </tr>
+
+              </thead>
+
+              <tbody id="batch-task-modal-list"></tbody>
+
+            </table>
+
+          </div>
+
+        </div>
+
+      </div>
+
+    </div>
+
+
+
+    <div id="password-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-backdrop" data-close-password></div>
+      <div class="modal-panel modal-narrow password-modal-panel">
+        <div class="modal-head">
+          <div>
+            <h2>账号默认密码</h2>
+            <p class="muted">注册成功的账号默认使用 config.json 里的 defaultPassword。</p>
+          </div>
+          <button class="ghost icon-btn" type="button" data-close-password>×</button>
+        </div>
+        <div class="modal-body password-modal-body">
+          <div class="field">
+            <label for="register-password-value">密码</label>
+            <div class="password-view-row">
+              <input id="register-password-value" type="password" readonly value="">
+              <button id="toggle-register-password" class="small" type="button">显示</button>
+              <button id="copy-register-password" class="primary small" type="button">复制</button>
+            </div>
+            <div id="register-password-modal-status" class="hint">读取中...</div>
+          </div>
+          <form id="register-password-form" class="password-edit-form">
+            <div class="field">
+              <label for="register-password-new">修改默认密码</label>
+              <input id="register-password-new" name="password" type="password" autocomplete="new-password" minlength="8" placeholder="输入新默认密码，至少 8 位">
+              <div class="hint">只影响后续新注册任务；已经注册成功的账号密码不会被改。</div>
+            </div>
+            <div class="modal-actions">
+              <button id="clear-register-password-new" class="ghost" type="button">清空</button>
+              <button id="save-register-password" class="primary" type="submit">保存新密码</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="modal-backdrop" data-close-settings></div>
+      <div class="modal-panel modal-settings">
+        <div class="modal-head">
+          <div>
+            <h2>注册配置</h2>
+            <p class="muted">这里修改 SMS 接码平台、国家和价格区间。保存后会写入 config.json。</p>
+          </div>
+          <button class="ghost icon-btn" type="button" data-close-settings>×</button>
+        </div>
+        <div class="modal-body settings-body">
+          <div class="settings-summary">
+            <div class="summary-tile">
+              <span class="label">当前平台</span>
+              <strong id="sms-active-provider">-</strong>
+            </div>
+            <div class="summary-tile">
+              <span class="label">国家</span>
+              <strong id="sms-active-countries">-</strong>
+            </div>
+            <div class="summary-tile">
+              <span class="label">价格区间</span>
+              <strong id="sms-active-prices">-</strong>
+            </div>
+            <div class="summary-tile">
+              <span class="label">默认代理</span>
+              <strong id="proxy-active-value">-</strong>
+            </div>
+          </div>
+
+          <div class="settings-section proxy-settings-section">
+            <div class="section-head compact-head">
+              <div>
+                <h3>默认代理</h3>
+                <p class="muted">注册、Sentinel 浏览器和 OA 登录默认都会读取 config.json 的 defaultProxyUrl；任务表单里的代理只做临时覆盖。</p>
+              </div>
+            </div>
+            <div class="field">
+              <label for="defaultProxyUrl">defaultProxyUrl</label>
+              <input id="defaultProxyUrl" placeholder="http://user:pass@host:port；填写 direct 或清空表示直连">
+              <div id="default-proxy-status" class="hint">当前默认代理读取中...</div>
+            </div>
+            <div class="row toolbar">
+              <button id="test-default-proxy" class="small" type="button">测试 OAuth 网络</button>
+              <button id="save-default-proxy" class="primary small" type="button">保存默认代理</button>
+              <button id="clear-default-proxy" class="ghost small" type="button">清空直连</button>
+            </div>
+            <pre id="default-proxy-result" class="probe-result hidden"></pre>
+          </div>
+
+          <form id="settings-form" class="settings-form">
+            <div class="field">
+              <label for="smsProvider">SMS 接码平台</label>
+              <select id="smsProvider" name="provider">
+                <option value="smsbower">SmsBower</option>
+                <option value="hero-sms">HeroSMS</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="smsService">服务代码</label>
+              <input id="smsService" name="service" placeholder="dr">
+            </div>
+            <div class="field">
+              <label for="smsApiKey">平台 API Key</label>
+              <input id="smsApiKey" name="apiKey" type="password" autocomplete="off" placeholder="留空表示继续使用当前密钥">
+              <div class="hint">只会写入当前选择的平台；留空不会覆盖 config.json 里的现有密钥。</div>
+            </div>
+            <div class="field">
+              <label for="smsBaseUrl">平台 API 地址</label>
+              <input id="smsBaseUrl" name="baseUrl" placeholder="https://smsbower.online/stubs/handler_api.php">
+              <div class="hint">通常不用改；切换平台时会自动带出当前平台地址。</div>
+            </div>
+            <div class="field span-full country-field">
+              <label for="smsCountrySelect">国家</label>
+              <div class="country-picker">
+                <input id="smsCountryFilter" class="country-filter" type="search" placeholder="搜索国家 / 英文 / 代码">
+                <select id="smsCountrySelect" class="country-select">
+                  <option value="">正在加载国家列表...</option>
+                </select>
+                <button id="use-sms-country" class="small" type="button">使用</button>
+                <button id="add-sms-country" class="ghost small" type="button">加备用</button>
+              </div>
+              <input id="smsCountries" name="countries" type="hidden">
+              <div id="smsCountrySelected" class="country-chip-list"></div>
+              <div id="sms-country-status" class="hint">下拉选择国家；“使用”会替换当前国家，“加备用”会加入轮询列表。</div>
+            </div>
+            <div class="field span-2 price-list-field">
+              <div class="label-row">
+                <label>平台价格列表</label>
+                <button id="fetch-sms-prices" class="small" type="button">查询当前国家价格</button>
+              </div>
+              <div id="smsPriceList" class="price-chip-list"></div>
+              <div id="sms-price-status" class="hint">从 SMS 平台实时查询当前国家和服务的可用价格，点击价格可加入/移出下方价格区间。</div>
+            </div>
+            <div class="field">
+              <label for="smsPriceTiers">价格区间</label>
+              <input id="smsPriceTiers" name="priceTiers" placeholder="0.016,0.017,0.054">
+              <div class="hint">从低到高填写多个价格，新任务会依次尝试，最大价自动取最高值。</div>
+            </div>
+            <div class="field key-status-field">
+              <label>平台密钥状态</label>
+              <div id="sms-key-status" class="key-status"></div>
+            </div>
+            <div class="modal-actions span-2">
+              <button class="ghost" type="button" data-close-settings>取消</button>
+              <button id="save-settings" class="primary" type="submit">保存配置</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/agent.js"></script>
+  <script src="/register.js"></script>
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Phone AT 控制台</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar shellbar">
+      <div class="title">
+        <div class="eyebrow">Dashboard</div>
+        <h1>Codex Phone AT 控制台</h1>
+        <p>手机号注册、AT 池、Plus 升级、OA 接入 SUB2API 的可视化入口。</p>
+      </div>
+      <nav class="nav">
+        <button class="nav-ai" type="button" data-agent-open>AI 接入</button>
+        <a class="active" href="/">首页</a>
+        <a href="/accounts">账户台账</a>
+        <a href="/register">手机号注册</a>
+        <a href="/plus">AT 升级</a>
+        <a href="/oa">OA 接入</a>
+        <button class="ghost" type="button" data-theme-toggle>白天</button>
+      </nav>
+    </header>
+
+    <section class="grid">
+      <div class="card">
+        <h2>快速入口</h2>
+        <p class="muted">三个页面共用同一个后端服务和同一个 AT 文件池。</p>
+        <div class="row">
+          <a class="button-link primary-link" href="/register">打开注册页</a>
+          <a class="button-link" href="/plus">打开升级页</a>
+          <a class="button-link" href="/oa">打开 OA 接入页</a>
+          <a class="button-link" href="/accounts">打开账户台账</a>
+        </div>
+      </div>
+      <div class="card">
+        <h2>服务状态</h2>
+        <div id="health" class="stat-grid"></div>
+        <pre id="raw">加载中...</pre>
+      </div>
+    </section>
+  </main>
+  <script>
+    async function load() {
+      const res = await fetch('/api/health');
+      const data = await res.json();
+      document.querySelector('#health').innerHTML = `
+        <div class="stat"><div class="label">AT 数量</div><div class="value">${data.counts.at}</div></div>
+        <div class="stat"><div class="label">注册任务</div><div class="value">${data.counts.registerTasks}</div></div>
+        <div class="stat"><div class="label">升级任务</div><div class="value">${data.counts.plusJobs}</div></div>
+        <div class="stat"><div class="label">OA 邮箱</div><div class="value">${data.counts.oaEmails}</div></div>
+        <div class="stat"><div class="label">OA 任务</div><div class="value">${data.counts.oaTasks}</div></div>
+        <div class="stat"><div class="label">PPXY Key</div><div class="value">${data.ppxy.apiKeyPresent ? '已配置' : '未配置'}</div></div>
+      `;
+      document.querySelector('#raw').textContent = JSON.stringify(data, null, 2);
+    }
+    load().catch((error) => {
+      document.querySelector('#raw').textContent = error.message;
+    });
+  </script>
+  <div id="toast" class="toast"></div>
+  <script src="/agent.js"></script>
+</body>
+</html>

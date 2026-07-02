@@ -200,6 +200,7 @@ code,
 
 h1,
 h2,
+h3,
 p {
   margin: 0;
 }
@@ -216,6 +217,11 @@ h2 {
   letter-spacing: -0.03em;
 }
 
+h3 {
+  font-size: 15px;
+  letter-spacing: -0.02em;
+}
+
 .subtitle {
   max-width: 850px;
   margin-top: 14px;
@@ -224,7 +230,39 @@ h2 {
   line-height: 1.7;
 }
 
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 152px;
+  padding: 28px 30px;
+  border-radius: 34px;
+}
+
+.topbar::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  background:
+    radial-gradient(circle at 18% 0%, rgba(34, 211, 238, 0.22), transparent 34%),
+    radial-gradient(circle at 88% 8%, rgba(167, 139, 250, 0.18), transparent 32%);
+}
+
+.topbar h1 {
+  font-size: clamp(32px, 3.4vw, 54px);
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .hero-actions,
+.top-actions,
 .row,
 .section-head {
   display: flex;
@@ -297,12 +335,25 @@ button.small {
   font-size: 12px;
 }
 
+button.tiny {
+  min-height: 26px;
+  padding: 5px 9px;
+  font-size: 11px;
+}
+
 button.big {
   width: 100%;
   min-height: 52px;
 }
 
 .stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin: 16px 0;
+}
+
+.overview-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
@@ -479,6 +530,70 @@ input[type="checkbox"] {
   grid-column: 1 / -1;
 }
 
+.task-panel {
+  min-height: 560px;
+}
+
+.list-toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.toolbar-subtitle {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.run-count-field {
+  width: 150px;
+}
+
+.task-table-wrap {
+  max-height: calc(100vh - 360px);
+  min-height: 380px;
+}
+
+.task-table {
+  min-width: 980px;
+}
+
+.task-row {
+  cursor: pointer;
+}
+
+.task-row.active {
+  background: rgba(34, 211, 238, 0.08);
+}
+
+.cell-with-action {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.cell-with-action .clipped {
+  flex: 1;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .action-panel {
   background:
     radial-gradient(circle at top right, rgba(52, 211, 153, 0.16), transparent 44%),
@@ -493,6 +608,59 @@ input[type="checkbox"] {
   border: 1px solid rgba(34, 211, 238, 0.24);
   border-radius: 22px;
   background: rgba(34, 211, 238, 0.08);
+}
+
+.pool-summary {
+  display: grid;
+  gap: 14px;
+}
+
+.pool-total {
+  padding: 16px;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+  border-radius: 22px;
+  background: rgba(34, 211, 238, 0.08);
+}
+
+.pool-total span,
+.pool-status-grid span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.pool-total strong {
+  display: block;
+  margin: 8px 0 6px;
+  font-size: 38px;
+  line-height: 1;
+  letter-spacing: -0.06em;
+}
+
+.pool-total small {
+  color: var(--muted);
+}
+
+.pool-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pool-status-grid div {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(2, 6, 23, 0.32);
+}
+
+.pool-status-grid strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 24px;
+  line-height: 1;
 }
 
 .hint {
@@ -678,6 +846,10 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
+.mini-result button {
+  margin-top: 10px;
+}
+
 .logs {
   display: grid;
   gap: 8px;
@@ -731,6 +903,97 @@ tbody tr:last-child td {
   backdrop-filter: blur(18px);
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(10px);
+}
+
+.modal-card {
+  width: min(1120px, calc(100vw - 48px));
+  max-height: min(760px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.settings-modal {
+  width: min(1180px, calc(100vw - 48px));
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.import-modal {
+  width: min(900px, calc(100vw - 48px));
+}
+
+.log-modal {
+  width: min(1040px, calc(100vw - 48px));
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.modal-body {
+  min-height: 0;
+  overflow: auto;
+}
+
+.settings-body {
+  display: grid;
+  gap: 14px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: rgba(2, 6, 23, 0.26);
+}
+
+.compact-head {
+  margin-bottom: 0;
+}
+
+.import-body {
+  display: grid;
+  gap: 14px;
+}
+
+.import-body textarea {
+  min-height: 260px;
+}
+
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding-top: 16px;
+}
+
+.modal-table {
+  max-height: 620px;
+}
+
+.modal-status-grid {
+  margin-bottom: 14px;
+}
+
+.empty-log {
+  display: block !important;
+  color: var(--muted);
+  text-align: center;
+}
+
 @media (max-width: 1180px) {
   .layout,
   .tables {
@@ -744,6 +1007,19 @@ tbody tr:last-child td {
   .stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .list-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar-actions {
+    justify-content: flex-start;
+  }
 }
 
 @media (max-width: 760px) {
@@ -753,6 +1029,7 @@ tbody tr:last-child td {
   }
 
   .hero,
+  .topbar,
   .section-head,
   .row.spread {
     align-items: stretch;
@@ -760,9 +1037,11 @@ tbody tr:last-child td {
   }
 
   .stats,
+  .overview-grid,
   .switch-grid,
   .compact-grid,
   .config-grid,
+  .pool-status-grid,
   .result-grid {
     grid-template-columns: 1fr;
   }
@@ -770,5 +1049,30 @@ tbody tr:last-child td {
   .hero {
     min-height: auto;
     padding: 22px;
+  }
+
+  .topbar {
+    min-height: auto;
+    padding: 22px;
+  }
+
+  .top-actions,
+  .toolbar-actions,
+  .modal-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .run-count-field {
+    width: 100%;
+  }
+
+  .modal-backdrop {
+    padding: 10px;
+  }
+
+  .modal-card {
+    width: calc(100vw - 20px);
+    max-height: calc(100vh - 20px);
   }
 }
