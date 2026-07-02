@@ -10,6 +10,7 @@ type K12Route = "request" | "accept";
 type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
 type LogLevel = "info" | "ok" | "warn" | "error";
 type TaskKind = "k12" | "at-repair";
+type JsonOutFormat = "sub2api" | "cpa";
 
 interface AppConfig {
   port: number;
@@ -35,6 +36,8 @@ interface AppConfig {
   sub2apiConcurrency: number;
   requireChatgptAccountId: boolean;
   tokenOut: string;
+  jsonOutDir: string;
+  jsonOutFormat: JsonOutFormat;
 }
 
 type EmailStatus = "free" | "running" | "success" | "failed" | "banned";
@@ -101,6 +104,8 @@ interface K12Task {
   accessTokenLivenessCheckedAt?: string;
   workspaceResults: K12WorkspaceResult[];
   sub2apiAccount?: string;
+  jsonOutFile?: string;
+  jsonOutFormat?: JsonOutFormat;
   logs: TaskLog[];
 }
 
@@ -121,6 +126,7 @@ const configFile = path.join(dataDir, "config.json");
 const emailsFile = path.join(dataDir, "emails.json");
 const tasksFile = path.join(dataDir, "tasks.json");
 const compatConfigFile = path.join(rootDir, "config.json");
+const defaultJsonOutDir = path.join(rootDir, "json");
 
 const DEFAULT_REFERENCE_BUNDLE = rootDir;
 const DEFAULT_WORKSPACE_ID = "631e1603-06cf-4f0b-b79b-d09fbfcfe98d";
@@ -183,6 +189,10 @@ function parseStringList(value: unknown): string[] {
 
 function uniqueStringList(values: string[]): string[] {
   return Array.from(new Set(values.map((item) => item.trim()).filter(Boolean)));
+}
+
+function normalizeJsonOutFormat(value: unknown): JsonOutFormat {
+  return String(value || "").trim().toLowerCase() === "cpa" ? "cpa" : "sub2api";
 }
 
 function randomItem<T>(items: T[]): T | undefined {
@@ -340,6 +350,8 @@ async function defaultConfig(): Promise<AppConfig> {
     sub2apiConcurrency: asNumber(ref.sub2apiConcurrency, 10, 1),
     requireChatgptAccountId: true,
     tokenOut,
+    jsonOutDir: defaultJsonOutDir,
+    jsonOutFormat: "sub2api",
   };
 }
 
@@ -378,6 +390,8 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     sub2apiConcurrency: asNumber(raw.sub2apiConcurrency, 10, 1),
     requireChatgptAccountId: asBoolean(raw.requireChatgptAccountId, true),
     tokenOut: asString(raw.tokenOut) || path.join(rootDir, "pool_tokens.txt"),
+    jsonOutDir: asString(raw.jsonOutDir) || defaultJsonOutDir,
+    jsonOutFormat: normalizeJsonOutFormat(raw.jsonOutFormat),
   };
 }
 
@@ -404,6 +418,8 @@ async function ensureCompatBundleConfig(): Promise<void> {
     sub2apiProxyName: appConfig.sub2apiProxyName,
     sub2apiAccountPriority: appConfig.sub2apiAccountPriority,
     sub2apiConcurrency: appConfig.sub2apiConcurrency,
+    jsonOutDir: appConfig.jsonOutDir,
+    jsonOutFormat: appConfig.jsonOutFormat,
   });
 }
 
@@ -607,6 +623,8 @@ function normalizeImportedTask(value: unknown): K12Task | null {
     accessTokenLivenessCheckedAt: asString(record.accessTokenLivenessCheckedAt) || undefined,
     workspaceResults,
     sub2apiAccount: asString(record.sub2apiAccount) || undefined,
+    jsonOutFile: asString(record.jsonOutFile) || undefined,
+    jsonOutFormat: record.jsonOutFormat ? normalizeJsonOutFormat(record.jsonOutFormat) : undefined,
     logs,
   };
 }
@@ -1810,6 +1828,269 @@ function buildSub2ApiCredentialsFromAccessToken(accessToken: string, fallbackEma
   return credentials;
 }
 
+function firstNonEmpty(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(Math.trunc(value));
+  }
+  return "";
+}
+
+function normalizeTimestampValue(value: unknown): string {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const ms = value > 1e11 ? value : value * 1000;
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return normalizeTimestampValue(numeric);
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+  }
+  return "";
+}
+
+function epochSecondsFromValue(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    const seconds = numeric > 1e11 ? numeric / 1000 : numeric;
+    return seconds > 0 ? Math.trunc(seconds) : undefined;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? Math.trunc(parsed / 1000) : undefined;
+}
+
+function firstPositiveEpochSeconds(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const seconds = epochSecondsFromValue(value);
+    if (seconds && seconds > 0) return seconds;
+  }
+  return undefined;
+}
+
+function encodeBase64UrlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function buildSyntheticCodexIdToken(email: string, accountId: string, planType: string, userId: string, expiresAt: string): string {
+  if (!accountId) return "";
+  const now = Math.trunc(Date.now() / 1000);
+  const expires = epochSecondsFromValue(expiresAt) || now + 90 * 24 * 60 * 60;
+  const authInfo: Record<string, unknown> = {chatgpt_account_id: accountId};
+  if (planType) authInfo.chatgpt_plan_type = planType;
+  if (userId) {
+    authInfo.chatgpt_user_id = userId;
+    authInfo.user_id = userId;
+  }
+  const payload: Record<string, unknown> = {
+    iat: now,
+    exp: expires,
+    "https://api.openai.com/auth": authInfo,
+  };
+  if (email) payload.email = email;
+  return `${encodeBase64UrlJson({alg: "none", typ: "JWT", cpa_synthetic: true})}.${encodeBase64UrlJson(payload)}.synthetic`;
+}
+
+function stripJsonUnavailable(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stripJsonUnavailable).filter((item) => item !== undefined);
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, stripJsonUnavailable(item)] as const)
+      .filter(([, item]) => item !== undefined);
+    return entries.length ? Object.fromEntries(entries) : undefined;
+  }
+  if (value === undefined || value === null || value === "") return undefined;
+  return value;
+}
+
+function stripUndefinedNull(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null));
+}
+
+function sanitizeFileToken(value: string, fallback = "account"): string {
+  const text = String(value || fallback)
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return (text || fallback).slice(0, 120);
+}
+
+function resolveJsonOutDir(): string {
+  const configured = asString(appConfig.jsonOutDir) || defaultJsonOutDir;
+  return path.isAbsolute(configured) ? configured : path.join(rootDir, configured);
+}
+
+function buildAccountJsonOutput(
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): {format: JsonOutFormat; accountName: string; data: unknown} {
+  const format = normalizeJsonOutFormat(appConfig.jsonOutFormat);
+  const credentials = options.credentials || {};
+  const payload = decodeJwtPayload(accessToken);
+  const auth = (payload["https://api.openai.com/auth"] || {}) as Record<string, unknown>;
+  const profile = (payload["https://api.openai.com/profile"] || {}) as Record<string, unknown>;
+  const inputIdToken = firstNonEmpty(credentials.id_token, credentials.idToken);
+  const idPayload = inputIdToken ? decodeJwtPayload(inputIdToken) : {};
+  const idAuth = (idPayload["https://api.openai.com/auth"] || {}) as Record<string, unknown>;
+
+  const accountId = firstNonEmpty(
+    auth.chatgpt_account_id,
+    credentials.chatgpt_account_id,
+    credentials.chatgptAccountId,
+    idAuth.chatgpt_account_id,
+    idAuth.account_id,
+  );
+  const userId = firstNonEmpty(
+    normalizeChatGptUserId(auth),
+    credentials.chatgpt_user_id,
+    credentials.chatgptUserId,
+    idAuth.chatgpt_user_id,
+    idAuth.user_id,
+  );
+  const outputEmail = firstNonEmpty(
+    profile.email,
+    payload.email,
+    credentials.email,
+    idPayload.email,
+    task.accessTokenEmail,
+    email.email,
+  );
+  const planType = firstNonEmpty(auth.chatgpt_plan_type, credentials.plan_type, credentials.planType, idAuth.chatgpt_plan_type);
+  const expiresAt = firstNonEmpty(
+    normalizeTimestampValue(credentials.expires_at),
+    normalizeTimestampValue(credentials.expiresAt),
+    normalizeTimestampValue(credentials.expired),
+    normalizeTimestampValue(payload.exp),
+    task.accessTokenExpiresAt,
+  );
+  const expiresEpoch = firstPositiveEpochSeconds(credentials.expires_at, credentials.expiresAt, credentials.expired, payload.exp, expiresAt);
+  const idTokenAccountId = firstNonEmpty(idAuth.chatgpt_account_id, idAuth.account_id);
+  const idTokenMatchesAccessToken = !inputIdToken || !accountId || !idTokenAccountId || idTokenAccountId === accountId;
+  const syntheticIdToken = idTokenMatchesAccessToken ? "" : buildSyntheticCodexIdToken(outputEmail, accountId, planType, userId, expiresAt);
+  const idToken = idTokenMatchesAccessToken
+    ? firstNonEmpty(inputIdToken, buildSyntheticCodexIdToken(outputEmail, accountId, planType, userId, expiresAt))
+    : syntheticIdToken;
+  const refreshToken = firstNonEmpty(credentials.refresh_token, credentials.refreshToken);
+  const sessionToken = firstNonEmpty(credentials.session_token, credentials.sessionToken);
+  const clientId = firstNonEmpty(credentials.client_id, credentials.clientId, payload.client_id, "app_X8zY6vW2pQ9tR3dE7nK1jL5gH");
+  const organizationId = firstNonEmpty(credentials.organization_id, credentials.organizationId);
+  const accountName = firstNonEmpty(
+    options.accountName,
+    task.sub2apiAccount,
+    email.sub2apiAccount,
+    outputEmail,
+    accountId,
+    email.email,
+  );
+  const exportedAt = nowIso();
+
+  const sub2apiAccount = stripJsonUnavailable({
+    name: accountName,
+    platform: "openai",
+    type: "oauth",
+    expires_at: expiresEpoch,
+    auto_pause_on_expired: true,
+    concurrency: appConfig.sub2apiConcurrency,
+    priority: appConfig.sub2apiAccountPriority,
+    rate_multiplier: 1,
+    credentials: {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      id_token: idToken,
+      session_token: sessionToken,
+      chatgpt_account_id: accountId,
+      chatgpt_user_id: userId,
+      client_id: clientId,
+      email: outputEmail,
+      expires_at: expiresEpoch,
+      organization_id: organizationId,
+      plan_type: planType,
+    },
+    extra: {
+      email: outputEmail,
+      privacy_mode: "training_off",
+      openai_oauth_responses_websockets_v2_enabled: false,
+      openai_oauth_responses_websockets_v2_mode: "off",
+      source: options.source || "gpt-k12",
+      no_rt: task.sub2apiNoRtMode === true || accountName.endsWith("--noRT") || undefined,
+    },
+  });
+
+  if (format === "sub2api") {
+    return {
+      format,
+      accountName,
+      data: {
+        exported_at: exportedAt,
+        proxies: [],
+        accounts: [sub2apiAccount],
+      },
+    };
+  }
+
+  return {
+    format,
+    accountName,
+    data: stripUndefinedNull({
+      type: "codex",
+      account_id: accountId,
+      chatgpt_account_id: accountId,
+      email: outputEmail,
+      name: accountName,
+      plan_type: planType,
+      chatgpt_plan_type: planType,
+      id_token: idToken,
+      id_token_synthetic: idToken.endsWith(".synthetic") || undefined,
+      access_token: accessToken,
+      refresh_token: refreshToken || "",
+      session_token: sessionToken,
+      last_refresh: exportedAt,
+      expired: expiresAt,
+      source: options.source || "gpt-k12",
+    }),
+  };
+}
+
+async function writeAccountJsonFile(
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): Promise<void> {
+  if (!accessToken) return;
+  const output = buildAccountJsonOutput(task, email, accessToken, options);
+  const outDir = resolveJsonOutDir();
+  await mkdir(outDir, {recursive: true});
+  const filename = `${output.format}-${sanitizeFileToken(output.accountName || email.email)}.json`;
+  const filePath = path.join(outDir, filename);
+  await writeFile(filePath, `${JSON.stringify(output.data, null, 2)}\n`, "utf8");
+  task.jsonOutFile = filePath;
+  task.jsonOutFormat = output.format;
+  appendLog(task, "ok", `账号 JSON 已写出: ${filePath}`);
+}
+
+async function tryWriteAccountJsonFile(
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): Promise<void> {
+  try {
+    await writeAccountJsonFile(task, email, accessToken, options);
+  } catch (error) {
+    appendLog(task, "warn", `账号 JSON 写出失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function pickErrorMessage(payload: unknown, fallback = "unknown error"): string {
   if (!payload || typeof payload !== "object") return fallback;
   const record = payload as Record<string, unknown>;
@@ -3004,6 +3285,8 @@ async function runTask(task: K12Task): Promise<void> {
     const useNoRtMode = task.sub2apiNoRtMode === true;
 
     let accessToken = "";
+    let jsonCredentials: Record<string, unknown> | undefined;
+    let jsonSource = "gpt-k12";
     if (task.runWorkspaceJoin) {
       accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
       recordAccessToken(task, email, accessToken);
@@ -3029,6 +3312,7 @@ async function runTask(task: K12Task): Promise<void> {
         const accountName = await upsertSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
         task.sub2apiAccount = accountName;
         email.sub2apiAccount = accountName;
+        jsonSource = "gpt-k12-nort";
       } else {
         try {
           const {Sub2ApiClient} = await loadBundleModules();
@@ -3057,6 +3341,8 @@ async function runTask(task: K12Task): Promise<void> {
           );
           task.sub2apiAccount = created.accountName;
           email.sub2apiAccount = created.accountName;
+          jsonCredentials = created.credentials || {};
+          jsonSource = "gpt-k12-oauth";
           appendLog(task, "ok", `Sub2API 账号已创建: ${created.accountName}`);
           if (!accessToken) {
             accessToken = extractAccessTokenFromCredentials(created.credentials || {});
@@ -3080,12 +3366,20 @@ async function runTask(task: K12Task): Promise<void> {
           const accountName = await createSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
           task.sub2apiAccount = accountName;
           email.sub2apiAccount = accountName;
+          jsonSource = "gpt-k12-add-phone-fallback";
         }
       }
     }
 
     if (task.runWorkspaceJoin && !useNoRtMode) {
       accessToken = await runK12WorkspaceJoin(client, task, email, accessToken);
+    }
+    if (accessToken) {
+      await tryWriteAccountJsonFile(task, email, accessToken, {
+        credentials: jsonCredentials,
+        accountName: task.sub2apiAccount || email.sub2apiAccount,
+        source: jsonSource,
+      });
     }
 
     task.status = "success";
@@ -3158,6 +3452,7 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
       const createdName = await createSub2ApiNoRtAccountFromAccessToken(task, email, newAccessToken);
       task.sub2apiAccount = createdName;
       email.sub2apiAccount = createdName;
+      await tryWriteAccountJsonFile(task, email, newAccessToken, {accountName: createdName, source: "gpt-k12-at-repair-create"});
       task.status = "success";
       email.status = "success";
       appendLog(task, "ok", `Sub2API 未有旧账号，已新增账号: ${createdName}`);
@@ -3183,6 +3478,11 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
       }
       if (local.ok) {
         recordAccessToken(task, email, oldAccessToken);
+        await tryWriteAccountJsonFile(task, email, oldAccessToken, {
+          credentials,
+          accountName,
+          source: "gpt-k12-at-repair-existing",
+        });
         task.status = "success";
         email.status = "success";
         appendLog(task, "ok", "当前 AT 仍可用，无需更新 Sub2API");
@@ -3196,6 +3496,11 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     appendLog(task, sub2apiTest.ok ? "ok" : "warn", `Sub2API 账号测活: ${sub2apiTest.message}`);
     if (sub2apiTest.ok && oldAccessToken) {
       recordAccessToken(task, email, oldAccessToken);
+      await tryWriteAccountJsonFile(task, email, oldAccessToken, {
+        credentials,
+        accountName,
+        source: "gpt-k12-at-repair-sub2api-ok",
+      });
       task.status = "success";
       email.status = "success";
       appendLog(task, "ok", "Sub2API 测活通过，无需更新");
@@ -3210,6 +3515,11 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     await appendTokenOut(newAccessToken);
 
     await updateSub2ApiAccountAccessToken(origin, adminToken, account, email, newAccessToken);
+    await tryWriteAccountJsonFile(task, email, newAccessToken, {
+      credentials,
+      accountName,
+      source: "gpt-k12-at-repair-updated",
+    });
     appendLog(task, "ok", `Sub2API 账号 AT 已更新: ${accountName}#${accountId}`);
     task.status = "success";
     email.status = "success";

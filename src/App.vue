@@ -272,6 +272,17 @@
                   <span>Token 输出文件</span>
                   <input v-model="form.tokenOut" />
                 </label>
+                <label class="field">
+                  <span>账号 JSON 类型</span>
+                  <select v-model="form.jsonOutFormat">
+                    <option value="sub2api">SUB2API</option>
+                    <option value="cpa">CPA</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>账号 JSON 写出目录</span>
+                  <input v-model="form.jsonOutDir" placeholder="默认项目 json 文件夹" />
+                </label>
               </div>
             </section>
           </div>
@@ -496,6 +507,10 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                 <strong>{{ selectedTask.sub2apiAccount || "-" }}</strong>
               </div>
               <div class="mini-result">
+                <span>JSON 文件</span>
+                <strong>{{ selectedTask.jsonOutFile || "-" }}</strong>
+              </div>
+              <div class="mini-result">
                 <span>K12 成功</span>
                 <strong>{{ selectedTask.workspaceResults.filter((r) => r.ok).length }}/{{ selectedTask.workspaceIds.length }}</strong>
               </div>
@@ -541,6 +556,8 @@ interface TaskItem {
   accessTokenLivenessMessage?: string;
   accessTokenLivenessCheckedAt?: string;
   sub2apiAccount?: string;
+  jsonOutFile?: string;
+  jsonOutFormat?: string;
   workspaceIds: string[];
   workspaceResults: Array<{ok: boolean}>;
   logs: Array<{at: string; level: string; message: string}>;
@@ -608,6 +625,8 @@ const form = reactive({
   sub2apiAccountPriority: 1,
   sub2apiConcurrency: 10,
   tokenOut: "",
+  jsonOutDir: "",
+  jsonOutFormat: "sub2api",
 });
 
 const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 0);
@@ -684,6 +703,8 @@ async function loadConfig() {
     sub2apiAccountPriority: config.sub2apiAccountPriority || 1,
     sub2apiConcurrency: config.sub2apiConcurrency || 10,
     tokenOut: config.tokenOut || "",
+    jsonOutDir: config.jsonOutDir || "",
+    jsonOutFormat: config.jsonOutFormat === "cpa" ? "cpa" : "sub2api",
   });
   workspaceText.value = (config.workspaceIds || []).join("\n");
 }
