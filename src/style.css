@@ -556,6 +556,10 @@ input[type="checkbox"] {
   flex-wrap: wrap;
 }
 
+.hidden-file-input {
+  display: none;
+}
+
 .run-count-field {
   width: 150px;
 }

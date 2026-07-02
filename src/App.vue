@@ -10,6 +10,11 @@
         <p class="subtitle">任务列表为主视图；配置、邮箱导入、邮箱池和任务日志都通过弹窗处理。</p>
       </div>
       <div class="top-actions">
+        <button class="ghost" @click="exportData">导出数据</button>
+        <button class="ghost" :disabled="importingData" @click="triggerDataImport">
+          {{ importingData ? "导入中..." : "导入数据" }}
+        </button>
+        <input ref="dataImportInput" class="hidden-file-input" type="file" accept="application/json,.json" @change="importDataFile" />
         <button class="ghost" @click="refreshAll">刷新</button>
         <button class="ghost" @click="openSettings">设置</button>
       </div>
@@ -564,11 +569,13 @@ const accessTokenCheckResult = ref("");
 const taskCheckResult = ref("");
 const selectedEmailIds = ref<string[]>([]);
 const selectedTaskIds = ref<string[]>([]);
+const dataImportInput = ref<HTMLInputElement | null>(null);
 const splitAliasCount = ref(4);
 const workspaceText = ref("");
 const runCount = ref(1);
 const toast = ref("");
 const savingConfig = ref(false);
+const importingData = ref(false);
 const showSettingsModal = ref(false);
 const showEmailImportModal = ref(false);
 const showEmailPoolModal = ref(false);
@@ -740,6 +747,64 @@ async function loadTasks() {
 
 async function refreshAll() {
   await Promise.all([loadSummary(), loadEmails(), loadTasks()]);
+}
+
+async function exportData() {
+  try {
+    const response = await fetch("/api/data/export");
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const matched = disposition.match(/filename="?([^"]+)"?/i);
+    const filename = matched?.[1] || `gpt-k12-data-${new Date().toISOString().slice(0, 10)}.json`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast("数据导出已开始下载");
+  } catch (error) {
+    showToast(`导出数据失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function triggerDataImport() {
+  dataImportInput.value?.click();
+}
+
+async function importDataFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  const ok = window.confirm("导入会覆盖当前配置、邮箱池、任务和 pool_tokens。系统会先自动备份当前数据。确认继续？");
+  if (!ok) {
+    input.value = "";
+    return;
+  }
+  importingData.value = true;
+  try {
+    const text = await file.text();
+    JSON.parse(text);
+    const result = await api<any>("/api/data/import", {method: "POST", body: text});
+    selectedEmailIds.value = [];
+    selectedTaskIds.value = [];
+    selectedTask.value = null;
+    showTaskLogModal.value = false;
+    await loadConfig();
+    await refreshAll();
+    showToast(`导入完成：邮箱 ${result.emails ?? 0}，任务 ${result.tasks ?? 0}`);
+  } catch (error) {
+    showToast(`导入数据失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    importingData.value = false;
+    input.value = "";
+  }
 }
 
 async function loadEmailImportFile(event: Event) {

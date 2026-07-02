@@ -506,6 +506,160 @@ async function persistTasks(): Promise<void> {
   await writeJson(tasksFile, tasks);
 }
 
+function hasRunningOrQueuedTasks(items = tasks): boolean {
+  return items.some((task) => task.status === "queued" || task.status === "running");
+}
+
+function normalizeImportedEmail(value: unknown): EmailRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const email = asString(record.email);
+  if (!email) return null;
+  const statusText = asString(record.status);
+  const allowedStatuses = new Set<EmailStatus>(["free", "running", "success", "failed", "banned"]);
+  const status = allowedStatuses.has(statusText as EmailStatus) ? statusText as EmailStatus : "free";
+  return {
+    id: asString(record.id) || stableId(email),
+    email,
+    parentEmail: asString(record.parentEmail) || undefined,
+    password: String(record.password || ""),
+    mailboxUrl: String(record.mailboxUrl || ""),
+    clientId: asString(record.clientId) || undefined,
+    refreshToken: asString(record.refreshToken) || undefined,
+    raw: String(record.raw || email),
+    status,
+    importedAt: asString(record.importedAt) || nowIso(),
+    updatedAt: asString(record.updatedAt) || nowIso(),
+    lastTaskId: asString(record.lastTaskId) || undefined,
+    lastError: asString(record.lastError) || undefined,
+    lastAccessTokenHash: asString(record.lastAccessTokenHash) || undefined,
+    sub2apiAccount: asString(record.sub2apiAccount) || undefined,
+  };
+}
+
+function normalizeImportedTask(value: unknown): K12Task | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const id = asString(record.id);
+  const emailId = asString(record.emailId);
+  const email = asString(record.email);
+  if (!id || !emailId || !email) return null;
+  const statusText = asString(record.status);
+  const allowedStatuses = new Set<TaskStatus>(["queued", "running", "success", "failed", "canceled"]);
+  const route = record.route === "accept" ? "accept" : "request";
+  const kind = record.kind === "at-repair" ? "at-repair" : "k12";
+  const logs = Array.isArray(record.logs)
+    ? record.logs
+      .filter((item) => item && typeof item === "object")
+      .map((item) => item as Record<string, unknown>)
+      .map((item) => ({
+        at: asString(item.at) || nowIso(),
+        level: (["info", "ok", "warn", "error"].includes(asString(item.level)) ? asString(item.level) : "info") as LogLevel,
+        message: String(item.message || ""),
+      }))
+    : [];
+  const workspaceResults = Array.isArray(record.workspaceResults)
+    ? record.workspaceResults
+      .filter((item) => item && typeof item === "object")
+      .map((item) => item as Record<string, unknown>)
+      .map((item) => ({
+        workspaceId: asString(item.workspaceId),
+        route: (item.route === "accept" ? "accept" : "request") as K12Route,
+        ok: asBoolean(item.ok, false),
+        status: asNumber(item.status, 0),
+        body: String(item.body || ""),
+        attempt: asNumber(item.attempt, 0),
+      }))
+    : [];
+  const liveness = asString(record.accessTokenLiveness);
+  const allowedLiveness = new Set(["unknown", "alive", "inactive", "banned", "error"]);
+  return {
+    id,
+    kind,
+    emailId,
+    email,
+    status: allowedStatuses.has(statusText as TaskStatus) ? statusText as TaskStatus : "failed",
+    route,
+    workspaceIds: parseStringList(record.workspaceIds),
+    runWorkspaceJoin: asBoolean(record.runWorkspaceJoin, true),
+    runSub2Api: asBoolean(record.runSub2Api, true),
+    sub2apiGroupName: asString(record.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12",
+    createdAt: asString(record.createdAt) || nowIso(),
+    updatedAt: asString(record.updatedAt) || nowIso(),
+    startedAt: asString(record.startedAt) || undefined,
+    finishedAt: asString(record.finishedAt) || undefined,
+    cancelRequested: asBoolean(record.cancelRequested, false) || undefined,
+    error: asString(record.error) || undefined,
+    accessToken: String(record.accessToken || ""),
+    accessTokenHash: asString(record.accessTokenHash) || undefined,
+    accessTokenPreview: asString(record.accessTokenPreview) || undefined,
+    accessTokenEmail: asString(record.accessTokenEmail) || undefined,
+    accessTokenExpiresAt: asString(record.accessTokenExpiresAt) || undefined,
+    accessTokenLiveness: allowedLiveness.has(liveness) ? liveness as K12Task["accessTokenLiveness"] : undefined,
+    accessTokenLivenessStatus: record.accessTokenLivenessStatus === undefined ? undefined : asNumber(record.accessTokenLivenessStatus, 0),
+    accessTokenLivenessMessage: asString(record.accessTokenLivenessMessage) || undefined,
+    accessTokenLivenessCheckedAt: asString(record.accessTokenLivenessCheckedAt) || undefined,
+    workspaceResults,
+    sub2apiAccount: asString(record.sub2apiAccount) || undefined,
+    logs,
+  };
+}
+
+async function buildDataExport(): Promise<Record<string, unknown>> {
+  return {
+    app: "gpt-k12",
+    version: 1,
+    exportedAt: nowIso(),
+    config: appConfig,
+    emails,
+    tasks,
+    tokenOutFileName: path.basename(appConfig.tokenOut || "pool_tokens.txt"),
+    tokenOut: await readFile(appConfig.tokenOut, "utf8").catch(() => ""),
+    summary: summary(),
+  };
+}
+
+async function backupCurrentDataBeforeImport(): Promise<string> {
+  const backupDir = path.join(dataDir, "backups");
+  await mkdir(backupDir, {recursive: true});
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupFile = path.join(backupDir, `before-import-${stamp}.json`);
+  await writeJson(backupFile, await buildDataExport());
+  return backupFile;
+}
+
+async function importDataBundle(bundle: Record<string, unknown>): Promise<{emails: number; tasks: number; tokenOut: boolean; backupFile: string}> {
+  if (hasRunningOrQueuedTasks()) throw new Error("当前还有运行中或队列任务，不能导入数据");
+
+  const importedEmails = Array.isArray(bundle.emails) ? bundle.emails.map(normalizeImportedEmail).filter(Boolean) as EmailRecord[] : [];
+  const importedTasks = Array.isArray(bundle.tasks) ? bundle.tasks.map(normalizeImportedTask).filter(Boolean) as K12Task[] : [];
+  if (hasRunningOrQueuedTasks(importedTasks)) throw new Error("导入包里包含运行中或队列任务，请先清理后再导入");
+
+  const importedConfig = bundle.config && typeof bundle.config === "object"
+    ? normalizeConfig({...appConfig, ...bundle.config as Partial<AppConfig>, tokenOut: appConfig.tokenOut})
+    : appConfig;
+  const backupFile = await backupCurrentDataBeforeImport();
+
+  appConfig = importedConfig;
+  emails = importedEmails;
+  tasks = importedTasks;
+  activeWorkers = 0;
+
+  await Promise.all([
+    saveConfig(appConfig),
+    persistEmails(),
+    persistTasks(),
+  ]);
+
+  const tokenText = typeof bundle.tokenOut === "string" ? bundle.tokenOut : "";
+  if (tokenText) {
+    await mkdir(path.dirname(appConfig.tokenOut), {recursive: true});
+    await writeFile(appConfig.tokenOut, tokenText, "utf8");
+  }
+
+  return {emails: emails.length, tasks: tasks.length, tokenOut: Boolean(tokenText), backupFile};
+}
+
 async function importEmails(text: string, config = appConfig): Promise<{added: number; updated: number; skipped: number; invalid: number; inputLines: number; total: number; invalidSamples: string[]}> {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   let added = 0;
@@ -3291,9 +3445,12 @@ async function reconcileAndPersistEmailStatuses(): Promise<boolean> {
 
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    if (Buffer.concat(chunks).length > 10 * 1024 * 1024) throw new Error("request body too large");
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > 50 * 1024 * 1024) throw new Error("request body too large");
+    chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
 }
@@ -3308,6 +3465,17 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   const body = `${JSON.stringify(data, null, 2)}\n`;
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+function sendJsonDownload(res: ServerResponse, data: unknown, filename: string): void {
+  const safeFilename = filename.replace(/[^\w.-]+/g, "_");
+  const body = `${JSON.stringify(data, null, 2)}\n`;
+  res.writeHead(200, {
+    "content-type": "application/json; charset=utf-8",
+    "content-disposition": `attachment; filename="${safeFilename}"`,
     "cache-control": "no-store",
   });
   res.end(body);
@@ -3356,6 +3524,22 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   if (method === "POST" && pathname === "/api/emails/reconcile") {
     const changed = await reconcileAndPersistEmailStatuses();
     sendJson(res, 200, {changed, summary: summary()});
+    return;
+  }
+
+  if (method === "GET" && pathname === "/api/data/export") {
+    sendJsonDownload(res, await buildDataExport(), `gpt-k12-data-${new Date().toISOString().slice(0, 10)}.json`);
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/data/import") {
+    try {
+      const body = await readJsonBody(req);
+      const result = await importDataBundle(body);
+      sendJson(res, 200, {...result, summary: summary()});
+    } catch (error) {
+      sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
+    }
     return;
   }
 
