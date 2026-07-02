@@ -1,4 +1,4 @@
-﻿import {createHash, randomUUID} from "node:crypto";
+﻿import {createHash, randomInt, randomUUID} from "node:crypto";
 import {existsSync} from "node:fs";
 import {mkdir, readFile, stat, writeFile} from "node:fs/promises";
 import {createServer, type IncomingMessage, type ServerResponse} from "node:http";
@@ -38,6 +38,7 @@ interface AppConfig {
 interface EmailRecord {
   id: string;
   email: string;
+  parentEmail?: string;
   password: string;
   mailboxUrl: string;
   clientId?: string;
@@ -443,6 +444,7 @@ function publicEmail(record: EmailRecord): Record<string, unknown> {
   return {
     id: record.id,
     email: record.email,
+    parentEmail: record.parentEmail,
     passwordPresent: Boolean(record.password),
     passwordMasked: maskSecret(record.password, 3, 3),
     mailboxUrlMasked: maskMailboxUrl(record.mailboxUrl),
@@ -574,6 +576,82 @@ function removeEmails(ids: string[]): {removed: number; skippedRunning: number; 
   });
 
   return {removed, skippedRunning, missing};
+}
+
+function rootMailboxIdentity(email: EmailRecord): string {
+  return (email.parentEmail || email.email).toLowerCase();
+}
+
+function rootMailboxIdentityByEmailId(emailId: string): string {
+  const email = emails.find((item) => item.id === emailId);
+  return email ? rootMailboxIdentity(email) : emailId;
+}
+
+function randomAliasSuffix(length = 6): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz";
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    out += alphabet[randomInt(0, alphabet.length)];
+  }
+  return out;
+}
+
+function buildPlusAlias(email: string, suffix: string): string {
+  const [local, domain] = email.split("@");
+  if (!local || !domain) throw new Error(`邮箱格式不正确，不能分裂: ${email}`);
+  const baseLocal = local.split("+")[0];
+  return `${baseLocal}+${suffix}@${domain}`;
+}
+
+function splitEmails(ids: string[], perParent: number): {created: number; skipped: number; items: Array<{parentEmail: string; email: string}>} {
+  const requested = new Set(ids.filter(Boolean));
+  const byEmail = new Set(emails.map((item) => item.email.toLowerCase()));
+  const processedParents = new Set<string>();
+  const createdItems: Array<{parentEmail: string; email: string}> = [];
+  let skipped = 0;
+
+  for (const parent of emails.filter((item) => requested.has(item.id))) {
+    const parentEmail = rootMailboxIdentity(parent);
+    if (processedParents.has(parentEmail)) {
+      skipped += 1;
+      continue;
+    }
+    processedParents.add(parentEmail);
+    if (parent.status === "running" || hasActiveTask(parent.id)) {
+      skipped += 1;
+      continue;
+    }
+    for (let i = 0; i < perParent; i += 1) {
+      let alias = "";
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        alias = buildPlusAlias(parentEmail, randomAliasSuffix(6));
+        if (!byEmail.has(alias.toLowerCase())) break;
+        alias = "";
+      }
+      if (!alias) {
+        skipped += 1;
+        continue;
+      }
+      const record: EmailRecord = {
+        id: stableId(alias),
+        email: alias,
+        parentEmail,
+        password: parent.password,
+        mailboxUrl: parent.mailboxUrl,
+        clientId: parent.clientId,
+        refreshToken: parent.refreshToken,
+        raw: `${alias}----alias-of----${parentEmail}`,
+        status: "free",
+        importedAt: nowIso(),
+        updatedAt: nowIso(),
+      };
+      emails.push(record);
+      byEmail.add(alias.toLowerCase());
+      createdItems.push({parentEmail, email: alias});
+    }
+  }
+
+  return {created: createdItems.length, skipped, items: createdItems.slice(0, 40)};
 }
 
 async function loadBundleModules() {
@@ -2181,8 +2259,18 @@ async function runTask(task: K12Task): Promise<void> {
 function scheduleTasks(): void {
   const limit = Math.max(1, appConfig.taskConcurrency);
   while (activeWorkers < limit) {
-    const task = tasks.find((item) => item.status === "queued" && !item.cancelRequested);
+    const activeRoots = new Set(
+      tasks
+        .filter((item) => item.status === "running")
+        .map((item) => rootMailboxIdentityByEmailId(item.emailId)),
+    );
+    const task = tasks.find((item) => (
+      item.status === "queued"
+      && !item.cancelRequested
+      && !activeRoots.has(rootMailboxIdentityByEmailId(item.emailId))
+    ));
     if (!task) break;
+    activeRoots.add(rootMailboxIdentityByEmailId(task.emailId));
     activeWorkers += 1;
     void runTask(task);
   }
@@ -2485,6 +2573,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     const result = removeEmails(ids);
     await persistEmails();
     sendJson(res, 200, result);
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/emails/split") {
+    const body = await readJsonBody(req);
+    const ids = Array.isArray(body.ids) ? body.ids.map((item) => String(item)).filter(Boolean) : [];
+    const count = asNumber(body.count, 4, 1, 50);
+    if (!ids.length) {
+      sendJson(res, 400, {error: "请选择至少一个母邮箱"});
+      return;
+    }
+    const result = splitEmails(ids, count);
+    await persistEmails();
+    sendJson(res, 200, {...result, total: emails.length});
     return;
   }
 

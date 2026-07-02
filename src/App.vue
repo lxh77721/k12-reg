@@ -289,6 +289,13 @@ email-----http://mail-api/api/GetLastEmails?email=..."
               <h2 id="email-pool-title">邮箱池列表</h2>
             </div>
             <div class="modal-actions">
+              <label class="field split-count-field">
+                <span>每个分裂</span>
+                <input v-model.number="splitAliasCount" type="number" min="1" max="50" />
+              </label>
+              <button class="ghost small" :disabled="!selectedEmailIds.length" @click="splitSelectedEmails">
+                分裂选中 x{{ splitAliasCount || 4 }}
+              </button>
               <button class="danger small" :disabled="!selectedEmailIds.length" @click="deleteSelectedEmails">
                 删除选中 {{ selectedEmailIds.length }}
               </button>
@@ -351,6 +358,7 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                         <span class="mono clipped">{{ item.email }}</span>
                         <button class="ghost tiny" @click="copyText(item.email, '邮箱已复制')">复制</button>
                       </div>
+                      <small v-if="item.parentEmail" class="muted">母邮箱：{{ item.parentEmail }}</small>
                     </td>
                     <td><span :class="['status', item.status]">{{ statusText(item.status) }}</span></td>
                     <td class="muted clipped">{{ item.mailboxUrlMasked }}</td>
@@ -452,6 +460,7 @@ import {computed, onMounted, onUnmounted, reactive, ref} from "vue";
 interface EmailItem {
   id: string;
   email: string;
+  parentEmail?: string;
   status: string;
   mailboxUrlMasked: string;
   sub2apiAccount?: string;
@@ -483,6 +492,7 @@ const emailText = ref("");
 const importResult = ref("");
 const importingEmails = ref(false);
 const selectedEmailIds = ref<string[]>([]);
+const splitAliasCount = ref(4);
 const workspaceText = ref("");
 const runCount = ref(1);
 const toast = ref("");
@@ -704,6 +714,20 @@ function toggleEmailSelection(id: string) {
 function toggleAllEmails(event: Event) {
   const checked = (event.target as HTMLInputElement).checked;
   selectedEmailIds.value = checked ? deletableEmails.value.map((item) => item.id) : [];
+}
+
+async function splitSelectedEmails() {
+  if (!selectedEmailIds.value.length) return;
+  const count = Math.max(1, Math.min(50, Number(splitAliasCount.value) || 4));
+  const ok = window.confirm(`确认将选中的 ${selectedEmailIds.value.length} 个邮箱按每个 ${count} 个子邮箱分裂？子邮箱会复用母邮箱接码地址。`);
+  if (!ok) return;
+  const result = await api<any>("/api/emails/split", {
+    method: "POST",
+    body: JSON.stringify({ids: selectedEmailIds.value, count}),
+  });
+  selectedEmailIds.value = [];
+  showToast(`分裂完成：新增 ${result.created ?? 0} 个子邮箱${result.skipped ? `，跳过 ${result.skipped} 个` : ""}`);
+  await refreshAll();
 }
 
 async function deleteEmail(id: string, email = "") {

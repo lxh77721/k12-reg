@@ -940,6 +940,11 @@ tbody tr:last-child td {
   flex-wrap: wrap;
 }
 
+.split-count-field {
+  width: 110px;
+  margin: 0;
+}
+
 .modal-body {
   min-height: 0;
   overflow: auto;
