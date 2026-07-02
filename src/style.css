@@ -566,15 +566,24 @@ input[type="checkbox"] {
 }
 
 .task-table {
-  min-width: 980px;
+  min-width: 1040px;
 }
 
 .task-row {
   cursor: pointer;
 }
 
+.select-col {
+  width: 42px;
+  text-align: center;
+}
+
 .task-row.active {
   background: rgba(34, 211, 238, 0.08);
+}
+
+.task-row.selected {
+  box-shadow: inset 3px 0 0 rgba(34, 211, 238, 0.75);
 }
 
 .cell-with-action {
@@ -586,6 +595,36 @@ input[type="checkbox"] {
 
 .cell-with-action .clipped {
   flex: 1;
+}
+
+.liveness-badge {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.liveness-badge.alive {
+  color: #bbf7d0;
+  border-color: rgba(52, 211, 153, 0.32);
+  background: rgba(52, 211, 153, 0.12);
+}
+
+.liveness-badge.inactive,
+.liveness-badge.banned {
+  color: #fecdd3;
+  border-color: rgba(251, 113, 133, 0.36);
+  background: rgba(251, 113, 133, 0.12);
+}
+
+.liveness-badge.error,
+.liveness-badge.unknown {
+  color: #fde68a;
+  border-color: rgba(251, 191, 36, 0.32);
+  background: rgba(251, 191, 36, 0.12);
 }
 
 .row-actions {
@@ -720,6 +759,12 @@ pre {
   color: #fecdd3;
   border-color: rgba(251, 113, 133, 0.3);
   background: rgba(251, 113, 133, 0.12);
+}
+
+.status.banned {
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.42);
+  background: rgba(127, 29, 29, 0.26);
 }
 
 .tables {

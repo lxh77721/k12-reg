@@ -24,7 +24,7 @@
       <article class="stat-card">
         <span>邮箱池</span>
         <strong>{{ summary.emails.total }}</strong>
-        <small>可用 {{ summary.emails.free }} / 失败 {{ summary.emails.failed }}</small>
+        <small>可用 {{ summary.emails.free }} / 失败 {{ summary.emails.failed }} / GPT封号 {{ summary.emails.banned }}</small>
       </article>
       <article class="stat-card">
         <span>成功</span>
@@ -46,6 +46,21 @@
           <p class="toolbar-subtitle">点击任务行打开日志弹窗。</p>
         </div>
         <div class="toolbar-actions">
+          <button class="ghost" :disabled="!selectedCheckableTaskIds.length || checkingTasks" @click="checkSelectedTasks">
+            {{ checkingTasks ? "测活中..." : `测活选中 ${selectedCheckableTaskIds.length}` }}
+          </button>
+          <button class="ghost" :disabled="!selectedTaskIds.length" @click="repairSelectedTasks">
+            修复AT {{ selectedTaskIds.length }}
+          </button>
+          <button class="ghost" :disabled="checkingTasks" @click="loadInactiveTaskData">
+            一键失活数据
+          </button>
+          <button class="ghost" :disabled="!inactiveMarkedTasks.length" @click="selectInactiveMarkedTasks">
+            勾选失活 {{ inactiveMarkedTasks.length }}
+          </button>
+          <button class="danger" :disabled="!summary.tasks.failed" @click="clearFailedTasks">
+            清理失败 {{ summary.tasks.failed }}
+          </button>
           <label class="field run-count-field">
             <span>本次处理数量</span>
             <input v-model.number="runCount" type="number" min="1" />
@@ -62,6 +77,9 @@
         <table class="task-table">
           <thead>
             <tr>
+              <th class="select-col">
+                <input type="checkbox" :checked="allCheckableTasksSelected" @change="toggleAllCheckableTasks" />
+              </th>
               <th>状态</th>
               <th>邮箱</th>
               <th>动作</th>
@@ -75,9 +93,12 @@
             <tr
               v-for="task in tasks"
               :key="task.id"
-              :class="['task-row', { active: selectedTask?.id === task.id }]"
+              :class="['task-row', { active: selectedTask?.id === task.id, selected: selectedTaskIds.includes(task.id) }]"
               @click="openTaskLog(task)"
             >
+              <td class="select-col" @click.stop>
+                <input type="checkbox" :checked="selectedTaskIds.includes(task.id)" @change="toggleTaskSelection(task.id)" />
+              </td>
               <td><span :class="['status', task.status]">{{ statusText(task.status) }}</span></td>
               <td>
                 <div class="cell-with-action">
@@ -89,6 +110,9 @@
               <td>
                 <div class="cell-with-action">
                   <span class="mono clipped">{{ task.accessTokenPreview || "pending" }}</span>
+                  <span v-if="task.accessTokenLiveness" :class="['liveness-badge', task.accessTokenLiveness]" :title="task.accessTokenLivenessMessage || ''">
+                    {{ livenessText(task.accessTokenLiveness) }}
+                  </span>
                   <button
                     class="ghost tiny"
                     :disabled="!task.accessToken && !task.accessTokenPreview"
@@ -103,6 +127,13 @@
               <td>
                 <div class="row-actions">
                   <button class="ghost small" @click.stop="openTaskLog(task)">日志</button>
+                  <button
+                    class="ghost small"
+                    :disabled="!canCheckTaskAt(task) || checkingTaskAtId === task.id"
+                    @click.stop="checkTaskAccessToken(task)"
+                  >
+                    {{ checkingTaskAtId === task.id ? "测活中" : "测活" }}
+                  </button>
                   <button
                     v-if="task.status === 'queued' || task.status === 'running'"
                     class="danger small"
@@ -133,6 +164,7 @@
           </tbody>
         </table>
       </div>
+      <pre v-if="taskCheckResult" class="check-result task-check-result">{{ taskCheckResult }}</pre>
     </section>
 
     <div v-if="toast" class="toast">{{ toast }}</div>
@@ -299,6 +331,12 @@ email-----http://mail-api/api/GetLastEmails?email=..."
               <button class="primary small" :disabled="!selectedRunnableEmailIds.length" @click="startSelectedEmailTasks">
                 启动选中 {{ selectedRunnableEmailIds.length }}
               </button>
+              <button class="ghost small" :disabled="!selectedRepairableEmailIds.length || checkingAccessTokens" @click="checkSelectedAccessTokens">
+                {{ checkingAccessTokens ? "检验中..." : `检验AT ${selectedRepairableEmailIds.length}` }}
+              </button>
+              <button class="ghost small" :disabled="!selectedRepairableEmailIds.length" @click="repairSelectedAccessTokens">
+                修复AT {{ selectedRepairableEmailIds.length }}
+              </button>
               <button class="ghost small" :disabled="!selectedEmailIds.length" @click="splitSelectedEmails">
                 分裂选中 x{{ splitAliasCount || 4 }}
               </button>
@@ -307,6 +345,7 @@ email-----http://mail-api/api/GetLastEmails?email=..."
               </button>
               <button class="danger small" :disabled="!summary.emails.failed" @click="deleteEmailsByStatus('failed')">删除失败</button>
               <button class="danger small" :disabled="!summary.emails.free" @click="deleteEmailsByStatus('free')">删除空闲</button>
+              <button class="danger small" :disabled="!summary.emails.banned" @click="deleteEmailsByStatus('banned')">删除GPT封号</button>
               <button class="ghost small" @click="loadEmails">刷新邮箱</button>
               <button class="ghost small" @click="closeEmailPool">关闭</button>
             </div>
@@ -329,7 +368,12 @@ email-----http://mail-api/api/GetLastEmails?email=..."
                 <span>失败</span>
                 <strong>{{ summary.emails.failed }}</strong>
               </div>
+              <div>
+                <span>GPT封号</span>
+                <strong>{{ summary.emails.banned }}</strong>
+              </div>
             </div>
+            <pre v-if="accessTokenCheckResult" class="check-result">{{ accessTokenCheckResult }}</pre>
             <div class="table-wrap modal-table">
               <table>
                 <thead>
@@ -474,19 +518,35 @@ interface EmailItem {
 
 interface TaskItem {
   id: string;
+  emailId?: string;
   email: string;
   status: string;
   route: string;
   accessToken?: string;
   accessTokenPreview?: string;
+  accessTokenLiveness?: string;
+  accessTokenLivenessStatus?: number;
+  accessTokenLivenessMessage?: string;
+  accessTokenLivenessCheckedAt?: string;
   sub2apiAccount?: string;
   workspaceIds: string[];
   workspaceResults: Array<{ok: boolean}>;
   logs: Array<{at: string; level: string; message: string}>;
 }
 
+interface AccessTokenCheckItem {
+  emailId?: string;
+  email: string;
+  accountName?: string;
+  accountId?: string;
+  ok: boolean;
+  status: number;
+  message: string;
+  latencyMs: number;
+}
+
 const defaultSummary = {
-  emails: {total: 0, free: 0, running: 0, success: 0, failed: 0},
+  emails: {total: 0, free: 0, running: 0, success: 0, failed: 0, banned: 0},
   tasks: {total: 0, queued: 0, running: 0, success: 0, failed: 0, canceled: 0},
 };
 
@@ -497,7 +557,13 @@ const selectedTask = ref<TaskItem | null>(null);
 const emailText = ref("");
 const importResult = ref("");
 const importingEmails = ref(false);
+const checkingAccessTokens = ref(false);
+const checkingTasks = ref(false);
+const checkingTaskAtId = ref("");
+const accessTokenCheckResult = ref("");
+const taskCheckResult = ref("");
 const selectedEmailIds = ref<string[]>([]);
+const selectedTaskIds = ref<string[]>([]);
 const splitAliasCount = ref(4);
 const workspaceText = ref("");
 const runCount = ref(1);
@@ -533,8 +599,17 @@ const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 
 const workspaceCount = computed(() => parseWorkspaceIds(workspaceText.value).length);
 const selectedReadyCount = computed(() => Math.min(Math.max(1, Number(runCount.value) || 1), emails.value.filter((item) => item.status === "free").length));
 const selectedRunnableEmailIds = computed(() => emails.value
-  .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running")
+  .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
   .map((item) => item.id));
+const selectedRepairableEmailIds = computed(() => emails.value
+  .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
+  .map((item) => item.id));
+const checkableTasks = computed(() => tasks.value.filter((item) => canCheckTaskAt(item)));
+const selectedCheckableTaskIds = computed(() => checkableTasks.value
+  .filter((item) => selectedTaskIds.value.includes(item.id))
+  .map((item) => item.id));
+const allCheckableTasksSelected = computed(() => checkableTasks.value.length > 0 && checkableTasks.value.every((item) => selectedTaskIds.value.includes(item.id)));
+const inactiveMarkedTasks = computed(() => tasks.value.filter((item) => item.accessTokenLiveness === "inactive" || item.accessTokenLiveness === "banned"));
 const selectableParentEmails = computed(() => emails.value.filter((item) => !item.parentEmail && item.status !== "running"));
 const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
 const deletableEmails = computed(() => emails.value.filter((item) => item.status !== "running"));
@@ -654,6 +729,8 @@ function closeEmailPool() {
 async function loadTasks() {
   const data = await api<any>("/api/tasks");
   tasks.value = data.items || [];
+  const existing = new Set(tasks.value.map((item) => item.id));
+  selectedTaskIds.value = selectedTaskIds.value.filter((id) => existing.has(id));
   if (selectedTask.value) {
     selectedTask.value = tasks.value.find((item) => item.id === selectedTask.value?.id) || selectedTask.value;
   } else if (tasks.value.length) {
@@ -767,7 +844,7 @@ async function deleteSelectedEmails() {
   await refreshAll();
 }
 
-async function deleteEmailsByStatus(status: "free" | "failed" | "success") {
+async function deleteEmailsByStatus(status: "free" | "failed" | "success" | "banned") {
   const label = statusText(status);
   const ok = window.confirm(`确认删除所有${label}邮箱？`);
   if (!ok) return;
@@ -807,6 +884,73 @@ async function startSelectedEmailTasks() {
   await refreshAll();
 }
 
+async function checkSelectedAccessTokens() {
+  const emailIds = selectedRepairableEmailIds.value;
+  if (!emailIds.length) {
+    showToast("请选择非运行中的邮箱");
+    return;
+  }
+  checkingAccessTokens.value = true;
+  accessTokenCheckResult.value = "";
+  try {
+    const data = await api<any>("/api/emails/check-at", {
+      method: "POST",
+      body: JSON.stringify({
+        emailIds,
+        sub2apiGroupName: form.sub2apiGroupName || "k12",
+      }),
+    });
+    const items = (data.items || []) as AccessTokenCheckItem[];
+    for (const result of items) {
+      if (!result.emailId || !result.accountName) continue;
+      const email = emails.value.find((item) => item.id === result.emailId);
+      if (email) email.sub2apiAccount = result.accountName;
+    }
+    const skipped = Number(data.skippedRunning || 0) + Number(data.missing || 0);
+    accessTokenCheckResult.value = [
+      `AT 检验完成：通过 ${data.ok ?? 0}，失败 ${data.failed ?? 0}${skipped ? `，跳过 ${skipped}` : ""}`,
+      ...items.slice(0, 20).map((item) => (
+        `${item.ok ? "OK" : "FAIL"} ${item.email}${item.accountName ? ` (${item.accountName})` : ""}: ${item.message}`
+      )),
+      items.length > 20 ? `还有 ${items.length - 20} 条未显示` : "",
+    ].filter(Boolean).join("\n");
+    showToast(`AT 检验完成：通过 ${data.ok ?? 0}，失败 ${data.failed ?? 0}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    accessTokenCheckResult.value = `AT 检验失败：${message}`;
+    showToast(`AT 检验失败：${message}`);
+  } finally {
+    checkingAccessTokens.value = false;
+  }
+}
+
+async function repairSelectedAccessTokens() {
+  const emailIds = selectedRepairableEmailIds.value;
+  if (!emailIds.length) {
+    showToast("请选择非运行中的邮箱");
+    return;
+  }
+  const ok = window.confirm(`确认修复选中的 ${emailIds.length} 个账号 AT？会创建任务，失效时重新邮箱接码登录并更新 Sub2API 对应账号。`);
+  if (!ok) return;
+  const saved = await saveConfig();
+  if (!saved) return;
+  const data = await api<any>("/api/tasks/repair-at", {
+    method: "POST",
+    body: JSON.stringify({
+      emailIds,
+      sub2apiGroupName: form.sub2apiGroupName || "k12",
+    }),
+  });
+  selectedEmailIds.value = [];
+  const skipped = Number(data.skippedRunning || 0) + Number(data.missing || 0) + Number(data.skippedNoAccount || 0);
+  if (data.tasks?.[0]) {
+    selectedTask.value = data.tasks[0];
+    showTaskLogModal.value = true;
+  }
+  showToast(`已创建 AT 修复任务 ${data.tasks?.length || 0} 个${skipped ? `，跳过 ${skipped} 个` : ""}`);
+  await refreshAll();
+}
+
 async function startTasks() {
   const saved = await saveConfig();
   if (!saved) return;
@@ -835,6 +979,150 @@ function canDeleteTask(task: TaskItem) {
   return task.status === "failed" || task.status === "canceled";
 }
 
+function canCheckTaskAt(task: TaskItem) {
+  return Boolean(task.accessToken || task.accessTokenPreview) && task.status !== "queued" && task.status !== "running";
+}
+
+function toggleTaskSelection(id: string) {
+  selectedTaskIds.value = selectedTaskIds.value.includes(id)
+    ? selectedTaskIds.value.filter((item) => item !== id)
+    : [...selectedTaskIds.value, id];
+}
+
+function toggleAllCheckableTasks(event: Event) {
+  const checked = (event.target as HTMLInputElement).checked;
+  selectedTaskIds.value = checked ? checkableTasks.value.map((item) => item.id) : [];
+}
+
+function selectInactiveMarkedTasks() {
+  selectedTaskIds.value = inactiveMarkedTasks.value.map((item) => item.id);
+  showToast(`已勾选失活任务 ${selectedTaskIds.value.length} 个`);
+}
+
+function livenessText(value: string) {
+  return ({
+    alive: "存活",
+    inactive: "失活",
+    banned: "GPT封号",
+    error: "错误",
+    unknown: "未知",
+  } as Record<string, string>)[value] || value;
+}
+
+function formatTaskCheckResult(data: any, title: string) {
+  const items = (data.items || []) as Array<{email: string; ok: boolean; inactive: boolean; status: number; message: string; repairTaskId?: string; skipped?: boolean}>;
+  return [
+    `${title}：检查 ${data.checked ?? 0}，正常 ${data.ok ?? 0}，失活 ${data.inactive ?? 0}，修复 ${data.repaired ?? 0}，跳过 ${data.skipped ?? 0}`,
+    ...items.slice(0, 80).map((item) => {
+      const tag = item.skipped ? "SKIP" : item.ok ? "OK" : item.inactive ? "INACTIVE" : "FAIL";
+      return `${tag} ${item.email} HTTP ${item.status || "-"}${item.repairTaskId ? ` repair=${item.repairTaskId}` : ""}: ${item.message}`;
+    }),
+    items.length > 80 ? `还有 ${items.length - 80} 条未显示` : "",
+  ].filter(Boolean).join("\n");
+}
+
+async function checkSelectedTasks() {
+  const taskIds = selectedCheckableTaskIds.value;
+  if (!taskIds.length) {
+    showToast("请选择有 AT 的非运行任务");
+    return;
+  }
+  checkingTasks.value = true;
+  taskCheckResult.value = "";
+  try {
+    const data = await api<any>("/api/tasks/check-at", {
+      method: "POST",
+      body: JSON.stringify({taskIds, autoRepair: false}),
+    });
+    taskCheckResult.value = formatTaskCheckResult(data, "任务 AT 测活完成");
+    showToast(`测活完成：失活 ${data.inactive ?? 0} 个`);
+    await refreshAll();
+  } catch (error) {
+    showToast(`批量测活失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    checkingTasks.value = false;
+  }
+}
+
+async function repairSelectedTasks() {
+  if (!selectedTaskIds.value.length) {
+    showToast("请选择任务");
+    return;
+  }
+  try {
+    const emailIds = Array.from(new Set(tasks.value
+      .filter((task) => selectedTaskIds.value.includes(task.id))
+      .map((task) => task.emailId)
+      .filter(Boolean))) as string[];
+    if (!emailIds.length) {
+      showToast("选中任务缺少邮箱记录");
+      return;
+    }
+    const data = await api<any>("/api/tasks/repair-at", {
+      method: "POST",
+      body: JSON.stringify({
+        emailIds,
+        sub2apiGroupName: form.sub2apiGroupName || "k12",
+      }),
+    });
+    if (data.tasks?.[0]) {
+      selectedTask.value = data.tasks[0];
+      showTaskLogModal.value = true;
+    }
+    const skipped = Number(data.skippedRunning || 0) + Number(data.missing || 0) + Number(data.skippedNoAccount || 0);
+    taskCheckResult.value = `已创建 AT 修复任务 ${data.tasks?.length || 0} 个${skipped ? `，跳过 ${skipped} 个` : ""}。Sub2API 没有账号时会自动新增账号。`;
+    showToast(`已创建 AT 修复任务 ${data.tasks?.length || 0} 个`);
+    await refreshAll();
+  } catch (error) {
+    showToast(`批量修复失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function loadInactiveTaskData() {
+  checkingTasks.value = true;
+  taskCheckResult.value = "";
+  try {
+    const data = await api<any>("/api/tasks/check-at", {
+      method: "POST",
+      body: JSON.stringify({onlyInactive: true, autoRepair: false}),
+    });
+    taskCheckResult.value = formatTaskCheckResult(data, "失活任务数据");
+    selectedTaskIds.value = (data.items || []).map((item: any) => item.taskId).filter(Boolean);
+    showToast(`已获取失活任务 ${data.inactive ?? 0} 个`);
+    await refreshAll();
+  } catch (error) {
+    showToast(`获取失活任务失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    checkingTasks.value = false;
+  }
+}
+
+async function checkTaskAccessToken(task: TaskItem) {
+  if (!canCheckTaskAt(task)) {
+    showToast("该任务没有可测活的 AT");
+    return;
+  }
+  checkingTaskAtId.value = task.id;
+  try {
+    const data = await api<any>(`/api/tasks/${encodeURIComponent(task.id)}/check-at`, {method: "POST", body: "{}"});
+    if (data.task) selectedTask.value = data.task;
+    if (data.result?.banned) {
+      showToast("账号已停用，当前邮箱记录已标记为GPT封号");
+    } else if (data.repairTask) {
+      selectedTask.value = data.repairTask;
+      showTaskLogModal.value = true;
+      showToast("AT 401，已自动创建修复任务");
+    } else {
+      showToast(data.result?.message || "AT 测活完成");
+    }
+    await refreshAll();
+  } catch (error) {
+    showToast(`AT 测活失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    checkingTaskAtId.value = "";
+  }
+}
+
 async function retryTask(id: string) {
   const data = await api<any>(`/api/tasks/${encodeURIComponent(id)}/retry`, {method: "POST", body: "{}"});
   if (data.task) {
@@ -852,6 +1140,20 @@ async function deleteTask(id: string) {
     showTaskLogModal.value = false;
   }
   showToast("任务已删除");
+  await refreshAll();
+}
+
+async function clearFailedTasks() {
+  if (!summary.tasks.failed) return;
+  const ok = window.confirm(`确认清理 ${summary.tasks.failed} 个失败任务？`);
+  if (!ok) return;
+  const result = await api<any>("/api/tasks/clear-failed", {method: "POST", body: "{}"});
+  selectedTaskIds.value = [];
+  if (selectedTask.value?.status === "failed") {
+    selectedTask.value = null;
+    showTaskLogModal.value = false;
+  }
+  showToast(`已清理失败任务 ${result.removed ?? 0} 个`);
   await refreshAll();
 }
 
@@ -896,6 +1198,7 @@ function statusText(status: string) {
     running: "运行中",
     success: "成功",
     failed: "失败",
+    banned: "GPT封号",
     queued: "队列",
     canceled: "已取消",
   } as Record<string, string>)[status] || status;

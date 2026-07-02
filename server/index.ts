@@ -9,6 +9,7 @@ import {fetch as undiciFetch, ProxyAgent} from "undici";
 type K12Route = "request" | "accept";
 type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
 type LogLevel = "info" | "ok" | "warn" | "error";
+type TaskKind = "k12" | "at-repair";
 
 interface AppConfig {
   port: number;
@@ -35,6 +36,8 @@ interface AppConfig {
   tokenOut: string;
 }
 
+type EmailStatus = "free" | "running" | "success" | "failed" | "banned";
+
 interface EmailRecord {
   id: string;
   email: string;
@@ -44,7 +47,7 @@ interface EmailRecord {
   clientId?: string;
   refreshToken?: string;
   raw: string;
-  status: "free" | "running" | "success" | "failed";
+  status: EmailStatus;
   importedAt: string;
   updatedAt: string;
   lastTaskId?: string;
@@ -70,6 +73,7 @@ interface TaskLog {
 
 interface K12Task {
   id: string;
+  kind?: TaskKind;
   emailId: string;
   email: string;
   status: TaskStatus;
@@ -89,6 +93,10 @@ interface K12Task {
   accessTokenPreview?: string;
   accessTokenEmail?: string;
   accessTokenExpiresAt?: string;
+  accessTokenLiveness?: "unknown" | "alive" | "inactive" | "banned" | "error";
+  accessTokenLivenessStatus?: number;
+  accessTokenLivenessMessage?: string;
+  accessTokenLivenessCheckedAt?: string;
   workspaceResults: K12WorkspaceResult[];
   sub2apiAccount?: string;
   logs: TaskLog[];
@@ -126,6 +134,8 @@ const AUTH_CHOOSE_ACCOUNT_URL = `${AUTH_BASE_URL}/choose-an-account`;
 const CODEX_CONSENT_URL = `${AUTH_BASE_URL}/sign-in-with-chatgpt/codex/consent`;
 const DEFAULT_OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CHATGPT_ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27";
+const CHATGPT_CODEX_RESPONSES_URL = `${CHATGPT_BASE_URL}/backend-api/codex/responses`;
+const DEFAULT_AT_LIVENESS_MODEL = "gpt-5.5";
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
 const sentinelSdkFile = path.join(rootDir, "sdk.js");
@@ -708,6 +718,11 @@ function isInvalidAuthStateError(error: unknown): boolean {
   return /invalid_state|invalid_auth_step|Invalid authorization step|sign-in session is no longer valid/i.test(message);
 }
 
+function isOpenAiAccountBannedMessage(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : String(value || "");
+  return /account_deactivated|account disabled|account has been (?:deleted|deactivated|disabled|suspended)|account.*(?:suspended|banned|terminated|deactivated|disabled)|user.*(?:suspended|banned|deactivated|disabled)|账号已停用|账户已停用|账号已被删除|账户已被删除|账号已封|账号被封|封号|被封禁|停用/i.test(message);
+}
+
 function isEmailOtpSendStepError(error: unknown): boolean {
   const message = error instanceof Error
     ? error.message
@@ -734,6 +749,7 @@ function authStepFromError(error: unknown): string {
 
 function normalizeFlowError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  if (isOpenAiAccountBannedMessage(message)) return "GPT 账号已被 OpenAI 停用/封禁";
   if (isAddPhoneFlowError(error)) {
     return "登录后触发 add-phone 手机接码页面，按 K12 规则判定失败";
   }
@@ -1223,6 +1239,25 @@ function recordAccessToken(task: K12Task, email: EmailRecord, accessToken: strin
   appendLog(task, "ok", `AT 获取成功: ${tokenInfo.preview} plan=${tokenInfo.planType || "?"} account=${tokenInfo.accountId ? tokenInfo.accountId.slice(0, 8) : "?"}`);
 }
 
+function markEmailBanned(email: EmailRecord, reason: string, task?: K12Task): void {
+  email.status = "banned";
+  email.lastError = reason;
+  email.updatedAt = nowIso();
+  for (const queuedTask of tasks) {
+    if (queuedTask.emailId !== email.id || queuedTask.id === task?.id || queuedTask.status !== "queued") continue;
+    queuedTask.status = "failed";
+    queuedTask.error = reason;
+    queuedTask.finishedAt = nowIso();
+    queuedTask.updatedAt = nowIso();
+    appendLog(queuedTask, "error", `当前邮箱记录已标记 GPT 封号，队列任务跳过: ${reason}`);
+  }
+  if (task) {
+    task.error = reason;
+    task.updatedAt = nowIso();
+    appendLog(task, "error", `当前邮箱记录已标记 GPT 封号: ${reason}`);
+  }
+}
+
 function normalizeChatGptUserId(auth: Record<string, unknown>): string {
   const direct = asString(auth.chatgpt_user_id || auth.user_id);
   if (direct) return direct;
@@ -1603,6 +1638,85 @@ function buildSub2ApiCredentialsFromAccessToken(accessToken: string, fallbackEma
   return credentials;
 }
 
+function pickErrorMessage(payload: unknown, fallback = "unknown error"): string {
+  if (!payload || typeof payload !== "object") return fallback;
+  const record = payload as Record<string, unknown>;
+  const error = record.error && typeof record.error === "object" ? record.error as Record<string, unknown> : null;
+  return asString(error?.message || error?.code || record.detail || record.message || record.error, fallback);
+}
+
+function extractItems(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  const record = payload as Record<string, unknown>;
+  for (const key of ["items", "accounts", "data", "records", "list"]) {
+    const value = record[key];
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === "object") {
+      const nested = extractItems(value);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+
+function unwrapSub2ApiAccount(value: Record<string, unknown>): Record<string, unknown> {
+  const nested = value.account || value.Account;
+  if (nested && typeof nested === "object") return nested as Record<string, unknown>;
+  return value;
+}
+
+function asIdString(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) return String(Math.trunc(value));
+  if (typeof value === "string") return value.trim();
+  return "";
+}
+
+function sub2ApiAccountId(account: Record<string, unknown>): string {
+  const unwrapped = unwrapSub2ApiAccount(account);
+  return asIdString(unwrapped.id) || asIdString(unwrapped.db_id) || asIdString(unwrapped.account_id);
+}
+
+function sub2ApiAccountName(account: Record<string, unknown>): string {
+  const unwrapped = unwrapSub2ApiAccount(account);
+  return asString(unwrapped.name || unwrapped.account_name);
+}
+
+function sub2ApiAccountCredentials(account: Record<string, unknown>): Record<string, unknown> {
+  const unwrapped = unwrapSub2ApiAccount(account);
+  return (unwrapped.credentials && typeof unwrapped.credentials === "object" ? unwrapped.credentials : {}) as Record<string, unknown>;
+}
+
+function mergeCredentials(existing: Record<string, unknown>, accessToken: string, email: EmailRecord): Record<string, unknown> {
+  const next: Record<string, unknown> = {
+    ...existing,
+    ...buildSub2ApiCredentialsFromAccessToken(accessToken, email.email),
+    access_token: accessToken,
+  };
+  for (const key of Object.keys(next)) {
+    if (next[key] === undefined || next[key] === null || next[key] === "") delete next[key];
+  }
+  return next;
+}
+
+function expectedSub2ApiAccountNames(email: EmailRecord, groupName = appConfig.sub2apiGroupName || "k12"): string[] {
+  return Array.from(new Set([
+    asString(email.sub2apiAccount),
+    `${email.email}---${groupName || "k12"}`,
+    `${email.email}--noRT`,
+  ].filter(Boolean)));
+}
+
+function findAccountByNames(accounts: unknown[], names: string[]): Record<string, unknown> | null {
+  const normalizedNames = new Set(names.map((item) => item.toLowerCase()));
+  for (const item of accounts) {
+    if (!item || typeof item !== "object") continue;
+    const account = unwrapSub2ApiAccount(item as Record<string, unknown>);
+    if (normalizedNames.has(sub2ApiAccountName(account).toLowerCase())) return account;
+  }
+  return null;
+}
+
 function normalizeSub2ApiOrigin(rawUrl: string): string {
   const normalized = asString(rawUrl).replace(/\/+$/, "");
   if (!normalized) throw new Error("Sub2API 地址为空");
@@ -1612,7 +1726,7 @@ function normalizeSub2ApiOrigin(rawUrl: string): string {
 async function requestSub2ApiJson(
   origin: string,
   pathname: string,
-  options: {method?: string; token?: string; body?: unknown; timeoutMs?: number} = {},
+  options: {method?: string; token?: string; body?: unknown; timeoutMs?: number; accept?: string} = {},
 ): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1000, options.timeoutMs ?? 30000));
@@ -1620,7 +1734,7 @@ async function requestSub2ApiJson(
     const response = await fetch(`${origin}${pathname}`, {
       method: options.method ?? "GET",
       headers: {
-        Accept: "application/json",
+        Accept: options.accept || "application/json",
         "Content-Type": "application/json",
         ...(options.token ? {Authorization: `Bearer ${options.token}`} : {}),
       },
@@ -1654,15 +1768,467 @@ async function requestSub2ApiJson(
   }
 }
 
-async function createSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: EmailRecord, accessToken: string): Promise<string> {
-  const groupName = task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12";
+async function loginSub2ApiAdmin(): Promise<{origin: string; token: string}> {
+  if (!appConfig.sub2apiUrl || !appConfig.sub2apiEmail || !appConfig.sub2apiPassword) {
+    throw new Error("Sub2API 配置不完整：地址、账号、密码均不能为空");
+  }
   const origin = normalizeSub2ApiOrigin(appConfig.sub2apiUrl);
   const loginData = (await requestSub2ApiJson(origin, "/api/v1/auth/login", {
     method: "POST",
     body: {email: appConfig.sub2apiEmail, password: appConfig.sub2apiPassword},
   })) as Record<string, unknown>;
-  const adminToken = asString(loginData.access_token || loginData.accessToken);
-  if (!adminToken) throw new Error("Sub2API 登录响应缺少 access_token");
+  const token = asString(loginData.access_token || loginData.accessToken);
+  if (!token) throw new Error("Sub2API 登录响应缺少 access_token");
+  return {origin, token};
+}
+
+async function findSub2ApiAccountByName(
+  origin: string,
+  adminToken: string,
+  names: string[],
+): Promise<Record<string, unknown> | null> {
+  const uniqueNames = Array.from(new Set(names.map((item) => item.trim()).filter(Boolean)));
+  for (const name of uniqueNames) {
+    const data = await requestSub2ApiJson(
+      origin,
+      `/api/v1/admin/accounts?page=1&page_size=20&platform=openai&type=oauth&search=${encodeURIComponent(name)}`,
+      {token: adminToken},
+    );
+    const found = findAccountByNames(extractItems(data), uniqueNames);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function testOpenAiAccessToken(accessToken: string, model = DEFAULT_AT_LIVENESS_MODEL): Promise<{ok: boolean; status: number; message: string; latencyMs: number; banned?: boolean}> {
+  const tokenInfo = summarizeToken(accessToken);
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await undiciFetch(CHATGPT_CODEX_RESPONSES_URL, {
+      method: "POST",
+      ...buildDownloadFetchOptions(),
+      headers: {
+        Accept: "text/event-stream, application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "OpenAI-Beta": "responses=experimental",
+        originator: "opencode",
+        ...(tokenInfo.accountId ? {"chatgpt-account-id": tokenInfo.accountId} : {}),
+      },
+      body: JSON.stringify({
+        model,
+        input: [{
+          role: "user",
+          content: [{type: "input_text", text: "hi"}],
+        }],
+        instructions: "You are a helpful assistant.",
+        stream: true,
+        store: false,
+      }),
+      signal: controller.signal,
+    });
+    const text = await response.text().catch(() => "");
+    const parsed = (() => {
+      try {
+        return text ? JSON.parse(text) : null;
+      } catch {
+        return null;
+      }
+    })();
+    const latencyMs = Date.now() - startedAt;
+    if (response.ok) {
+      return {ok: true, status: response.status, message: `AT 存活: HTTP ${response.status} / ${latencyMs}ms`, latencyMs};
+    }
+    const reason = pickErrorMessage(parsed, text.slice(0, 240) || `HTTP ${response.status}`);
+    const message = `AT 失效/不可用: HTTP ${response.status}: ${reason}`;
+    return {ok: false, status: response.status, message, latencyMs, banned: isOpenAiAccountBannedMessage(`${reason}\n${text}`)};
+  } catch (error) {
+    const latencyMs = Date.now() - startedAt;
+    if (error instanceof Error && error.name === "AbortError") {
+      return {ok: false, status: 0, message: "AT 测活超时", latencyMs};
+    }
+    const message = `AT 测活失败: ${error instanceof Error ? error.message : String(error)}`;
+    return {ok: false, status: 0, message, latencyMs, banned: isOpenAiAccountBannedMessage(message)};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function testSub2ApiAccountLiveness(
+  origin: string,
+  adminToken: string,
+  accountId: string,
+  model = DEFAULT_AT_LIVENESS_MODEL,
+): Promise<{ok: boolean; status: number; message: string; latencyMs: number}> {
+  const startedAt = Date.now();
+  try {
+    const data = await requestSub2ApiJson(origin, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}/test`, {
+      method: "POST",
+      token: adminToken,
+      body: {model_id: model, prompt: ""},
+      timeoutMs: 60000,
+      accept: "text/event-stream, application/json",
+    });
+    const raw = typeof data === "string"
+      ? data
+      : data && typeof data === "object" && typeof (data as Record<string, unknown>).raw === "string"
+        ? String((data as Record<string, unknown>).raw)
+        : JSON.stringify(data || "");
+    const lower = raw.toLowerCase();
+    const latencyMs = Date.now() - startedAt;
+    if (lower.includes("\"type\":\"error\"") || lower.includes("\"success\":false")) {
+      return {ok: false, status: 0, message: `Sub2API 测活失败: ${raw.slice(0, 240)}`, latencyMs};
+    }
+    return {ok: true, status: 200, message: `Sub2API 测活通过 / ${latencyMs}ms`, latencyMs};
+  } catch (error) {
+    const latencyMs = Date.now() - startedAt;
+    return {ok: false, status: 0, message: `Sub2API 测活失败: ${error instanceof Error ? error.message : String(error)}`, latencyMs};
+  }
+}
+
+async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<{
+  items: Array<{
+    emailId: string;
+    email: string;
+    accountName: string;
+    accountId: string;
+    ok: boolean;
+    status: number;
+    message: string;
+    latencyMs: number;
+  }>;
+  ok: number;
+  failed: number;
+  missing: number;
+  skippedRunning: number;
+}> {
+  const requestedEmailIds = Array.isArray(body.emailIds)
+    ? body.emailIds.map((item) => String(item)).filter(Boolean)
+    : [];
+  const requested = new Set(requestedEmailIds);
+  const existingIds = new Set(emails.map((item) => item.id));
+  const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
+  const selectedEmails = emails.filter((item) => requested.has(item.id));
+  const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
+  const items: Array<{
+    emailId: string;
+    email: string;
+    accountName: string;
+    accountId: string;
+    ok: boolean;
+    status: number;
+    message: string;
+    latencyMs: number;
+  }> = [];
+  let skippedRunning = 0;
+  let changedEmails = false;
+
+  const {origin, token: adminToken} = await loginSub2ApiAdmin();
+
+  for (const email of selectedEmails) {
+    if (email.status === "running" || email.status === "banned" || hasActiveTask(email.id)) {
+      skippedRunning += 1;
+      continue;
+    }
+
+    const startedAt = Date.now();
+    try {
+      const names = expectedSub2ApiAccountNames(email, sub2apiGroupName);
+      const account = await findSub2ApiAccountByName(origin, adminToken, names);
+      if (!account) {
+        const message = `Sub2API 未找到账号: ${names.join(" / ")}`;
+        items.push({
+          emailId: email.id,
+          email: email.email,
+          accountName: "",
+          accountId: "",
+          ok: false,
+          status: 404,
+          message,
+          latencyMs: Date.now() - startedAt,
+        });
+        continue;
+      }
+
+      const accountId = sub2ApiAccountId(account);
+      const accountName = sub2ApiAccountName(account);
+      if (accountName && email.sub2apiAccount !== accountName) {
+        email.sub2apiAccount = accountName;
+        email.updatedAt = nowIso();
+        changedEmails = true;
+      }
+      if (!accountId) {
+        items.push({
+          emailId: email.id,
+          email: email.email,
+          accountName,
+          accountId: "",
+          ok: false,
+          status: 0,
+          message: `Sub2API 账号缺少 id: ${accountName || "(unknown)"}`,
+          latencyMs: Date.now() - startedAt,
+        });
+        continue;
+      }
+
+      const accessToken = extractAccessTokenFromCredentials(sub2ApiAccountCredentials(account));
+      const result = accessToken
+        ? await testOpenAiAccessToken(accessToken)
+        : await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+      items.push({
+        emailId: email.id,
+        email: email.email,
+        accountName,
+        accountId,
+        ok: result.ok,
+        status: result.status,
+        message: result.message,
+        latencyMs: result.latencyMs,
+      });
+    } catch (error) {
+      items.push({
+        emailId: email.id,
+        email: email.email,
+        accountName: "",
+        accountId: "",
+        ok: false,
+        status: 0,
+        message: error instanceof Error ? error.message : String(error),
+        latencyMs: Date.now() - startedAt,
+      });
+    }
+  }
+
+  if (changedEmails) await persistEmails();
+  return {
+    items,
+    ok: items.filter((item) => item.ok).length,
+    failed: items.filter((item) => !item.ok).length,
+    missing,
+    skippedRunning,
+  };
+}
+
+async function checkTaskAccessToken(task: K12Task): Promise<{
+  task: Record<string, unknown>;
+  email?: Record<string, unknown>;
+  result: {ok: boolean; status: number; message: string; latencyMs: number; banned?: boolean};
+  repairTask?: Record<string, unknown>;
+}> {
+  return checkTaskAccessTokenWithOptions(task, {autoRepair: true});
+}
+
+function isInactiveAccessTokenResult(result: {ok: boolean; status: number; message: string; banned?: boolean}): boolean {
+  if (result.ok) return false;
+  if (result.banned) return true;
+  if (result.status === 401 || result.status === 403) return true;
+  return /unauthorized|invalid[_ -]?token|token.*expired|access.*denied|account.*(?:deactivated|disabled|suspended|banned)|封号|停用|被封禁/i.test(result.message);
+}
+
+function recordTaskAccessTokenLiveness(
+  task: K12Task,
+  result: {ok: boolean; status: number; message: string; banned?: boolean} | null,
+  fallback: "unknown" | "error" = "error",
+): void {
+  if (!result) {
+    task.accessTokenLiveness = fallback;
+    task.accessTokenLivenessStatus = 0;
+    task.accessTokenLivenessMessage = fallback === "unknown" ? "" : "未完成测活";
+  } else {
+    task.accessTokenLiveness = result.banned
+      ? "banned"
+      : result.ok
+        ? "alive"
+        : isInactiveAccessTokenResult(result)
+          ? "inactive"
+          : "error";
+    task.accessTokenLivenessStatus = result.status;
+    task.accessTokenLivenessMessage = result.message;
+  }
+  task.accessTokenLivenessCheckedAt = nowIso();
+}
+
+async function checkTaskAccessTokenWithOptions(
+  task: K12Task,
+  options: {autoRepair?: boolean} = {},
+): Promise<{
+  task: Record<string, unknown>;
+  email?: Record<string, unknown>;
+  result: {ok: boolean; status: number; message: string; latencyMs: number; banned?: boolean};
+  repairTask?: Record<string, unknown>;
+}> {
+  if (task.status === "queued" || task.status === "running") {
+    throw new Error("任务正在运行/排队中，不能测活");
+  }
+  const email = emails.find((item) => item.id === task.emailId);
+  if (!email) throw new Error("邮箱记录不存在");
+  if (email.status === "banned") throw new Error("该邮箱已标记封号，不再测活/修复");
+
+  if (!task.accessToken && appConfig.tokenOut) {
+    if (await hydrateTaskAccessTokensFromTokenOut()) await persistTasks();
+  }
+  if (!task.accessToken) {
+    throw new Error("该任务没有保存完整 AT，无法测活；需要先重新跑一次获取 AT");
+  }
+
+  appendLog(task, "info", "开始使用任务保存的 AT 测活");
+  const result = await testOpenAiAccessToken(task.accessToken);
+  recordTaskAccessTokenLiveness(task, result);
+  appendLog(task, result.ok ? "ok" : "warn", `任务 AT 测活: ${result.message}`);
+
+  let repairTask: K12Task | undefined;
+  if (result.banned) {
+    markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止继续获取 AT", task);
+  } else if (options.autoRepair !== false && !result.ok && result.status === 401) {
+    appendLog(task, "warn", "AT 返回 401，自动创建 AT 修复任务");
+    const created = createAtRepairTasks({
+      emailIds: [task.emailId],
+      sub2apiGroupName: task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12",
+    });
+    repairTask = created.created[0];
+    if (!repairTask && created.skippedRunning) {
+      appendLog(task, "warn", "AT 修复任务未创建：该邮箱已有运行中任务");
+    }
+  } else if (!result.ok) {
+    email.lastError = result.message;
+    email.updatedAt = nowIso();
+  }
+
+  task.updatedAt = nowIso();
+  await Promise.all([persistTasks(), persistEmails()]);
+  return {
+    task: publicTask(task),
+    email: publicEmail(email),
+    result,
+    repairTask: repairTask ? publicTask(repairTask) : undefined,
+  };
+}
+
+async function checkTaskAccessTokens(body: Record<string, unknown>): Promise<{
+  items: Array<{
+    taskId: string;
+    emailId: string;
+    email: string;
+    ok: boolean;
+    inactive: boolean;
+    status: number;
+    message: string;
+    latencyMs: number;
+    banned?: boolean;
+    repairTaskId?: string;
+    skipped?: boolean;
+  }>;
+  checked: number;
+  inactive: number;
+  ok: number;
+  repaired: number;
+  skipped: number;
+}> {
+  if (await hydrateTaskAccessTokensFromTokenOut()) await persistTasks();
+  const taskIds = Array.isArray(body.taskIds)
+    ? body.taskIds.map((item) => String(item)).filter(Boolean)
+    : [];
+  const idSet = new Set(taskIds);
+  const onlyInactive = asBoolean(body.onlyInactive, false);
+  const autoRepair = asBoolean(body.autoRepair, false);
+  const candidates = taskIds.length
+    ? tasks.filter((task) => idSet.has(task.id))
+    : tasks.filter((task) => task.status !== "queued" && task.status !== "running" && (task.accessToken || task.accessTokenPreview));
+
+  const items: Array<{
+    taskId: string;
+    emailId: string;
+    email: string;
+    ok: boolean;
+    inactive: boolean;
+    status: number;
+    message: string;
+    latencyMs: number;
+    banned?: boolean;
+    repairTaskId?: string;
+    skipped?: boolean;
+  }> = [];
+
+  for (const task of candidates) {
+    try {
+      const checked = await checkTaskAccessTokenWithOptions(task, {autoRepair});
+      const inactive = isInactiveAccessTokenResult(checked.result);
+      if (onlyInactive && !inactive) continue;
+      items.push({
+        taskId: task.id,
+        emailId: task.emailId,
+        email: task.email,
+        ok: checked.result.ok,
+        inactive,
+        status: checked.result.status,
+        message: checked.result.message,
+        latencyMs: checked.result.latencyMs,
+        banned: checked.result.banned,
+        repairTaskId: asString(checked.repairTask && (checked.repairTask as Record<string, unknown>).id),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (onlyInactive) continue;
+      recordTaskAccessTokenLiveness(task, {ok: false, status: 0, message});
+      items.push({
+        taskId: task.id,
+        emailId: task.emailId,
+        email: task.email,
+        ok: false,
+        inactive: false,
+        status: 0,
+        message,
+        latencyMs: 0,
+        skipped: true,
+      });
+    }
+  }
+
+  return {
+    items,
+    checked: items.filter((item) => !item.skipped).length,
+    inactive: items.filter((item) => item.inactive).length,
+    ok: items.filter((item) => item.ok).length,
+    repaired: items.filter((item) => item.repairTaskId).length,
+    skipped: items.filter((item) => item.skipped).length,
+  };
+}
+
+async function updateSub2ApiAccountAccessToken(
+  origin: string,
+  adminToken: string,
+  account: Record<string, unknown>,
+  email: EmailRecord,
+  accessToken: string,
+): Promise<void> {
+  const accountId = sub2ApiAccountId(account);
+  if (!accountId) throw new Error("Sub2API 账号缺少 id，无法更新");
+  const credentials = mergeCredentials(
+    sub2ApiAccountCredentials(account),
+    accessToken,
+    email,
+  );
+  await requestSub2ApiJson(origin, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}/apply-oauth-credentials`, {
+    method: "POST",
+    token: adminToken,
+    body: {
+      type: "oauth",
+      credentials,
+      extra: {
+        email: credentials.email || email.email,
+        at_repaired_at: nowIso(),
+        at_repair_source: "gpt-k12",
+      },
+    },
+    timeoutMs: 60000,
+  });
+}
+
+async function createSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: EmailRecord, accessToken: string): Promise<string> {
+  const groupName = task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12";
+  const {origin, token: adminToken} = await loginSub2ApiAdmin();
 
   const groupsData = await requestSub2ApiJson(origin, "/api/v1/admin/groups/all", {token: adminToken});
   const groups = Array.isArray(groupsData) ? groupsData : [];
@@ -1724,6 +2290,46 @@ async function getAuthSessionCandidates(client: any): Promise<Record<string, unk
     }
   }
   return candidates;
+}
+
+async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Promise<any> {
+  await ensureSentinelSdk();
+  const {OpenAIClient, generateRandomDeviceProfile, MailboxUrlCodeProvider} = await loadBundleModules();
+  const mailboxProvider = new MailboxUrlCodeProvider(email.mailboxUrl);
+  let baseline: unknown = null;
+  try {
+    baseline = await mailboxProvider.snapshot();
+    appendLog(task, "info", "邮箱基线已读取，等待新验证码");
+  } catch (error) {
+    appendLog(task, "warn", `邮箱基线读取失败，将直接轮询新验证码: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const fetchOtp = async (label: string) => {
+    appendLog(task, "info", `等待 ${label} 验证码: ${email.email}`);
+    const code = await mailboxProvider.waitForCode({
+      baseline,
+      timeoutMs: 120000,
+      intervalMs: 3000,
+      allowBaselineCodeAfterMs: 45000,
+    });
+    appendLog(task, "ok", `${label} 验证码已获取`);
+    try {
+      baseline = await mailboxProvider.snapshot();
+    } catch {
+      // Baseline refresh is best effort only.
+    }
+    return code;
+  };
+
+  return new OpenAIClient({
+    email: email.email,
+    password: appConfig.defaultPassword,
+    deviceProfile: generateRandomDeviceProfile(),
+    signupScreenHint: "signup",
+    bindEmail: email.email,
+    fetchEmailOtp: () => fetchOtp("登录"),
+    fetchAddEmailOtp: () => fetchOtp("绑定邮箱"),
+  });
 }
 
 function collectIds(value: unknown, names: string[], out = new Set<string>()): Set<string> {
@@ -1989,6 +2595,10 @@ async function followToLocalhostCallback(client: any, startUrl: string, task?: K
   let currentUrl = startUrl;
   for (let hop = 0; hop < 12; hop += 1) {
     if (currentUrl.startsWith(DEFAULT_OAUTH_REDIRECT_URI)) return currentUrl;
+    if (currentUrl.startsWith(CODEX_CONSENT_URL)) {
+      currentUrl = await continueCodexConsent(client, currentUrl, task);
+      continue;
+    }
     if (isAddPhoneUrl(currentUrl)) {
       throw new Error("登录后触发 add-phone 手机接码页面，按 K12 规则判定失败");
     }
@@ -2011,6 +2621,10 @@ async function followToLocalhostCallback(client: any, startUrl: string, task?: K
       continue;
     }
     if (response.url?.startsWith(DEFAULT_OAUTH_REDIRECT_URI)) return response.url;
+    if (response.url?.startsWith(CODEX_CONSENT_URL)) {
+      currentUrl = await continueCodexConsent(client, response.url, task);
+      continue;
+    }
     if (response.url && isAddPhoneUrl(response.url)) {
       throw new Error("登录后触发 add-phone 手机接码页面，按 K12 规则判定失败");
     }
@@ -2024,7 +2638,27 @@ async function followToLocalhostCallback(client: any, startUrl: string, task?: K
 }
 
 async function continueCodexConsent(client: any, consentUrl: string, task?: K12Task): Promise<string> {
-  if (task) appendLog(task, "info", "已到 Codex consent 页，直接点击 Continue");
+  if (task) appendLog(task, "info", "已到 Codex consent 页，优先选择 K12 workspace");
+  await client.fetch(consentUrl, {
+    method: "GET",
+    redirect: "manual",
+    headers: oauthBrowserHeaders(client, {
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      referer: AUTH_BASE_URL,
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "same-origin",
+    }),
+  }).catch(() => undefined);
+
+  try {
+    const nextUrl = await selectAuthWorkspace(client, task, consentUrl);
+    if (nextUrl && !nextUrl.startsWith(CODEX_CONSENT_URL)) return nextUrl;
+  } catch (error) {
+    if (task) appendLog(task, "warn", `consent workspace/select 不可用，改为直接 Continue: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (task) appendLog(task, "info", "Codex consent fallback：直接点击 Continue");
   const response = await client.fetch(consentUrl, {
     method: "POST",
     redirect: "manual",
@@ -2098,6 +2732,15 @@ async function runTask(task: K12Task): Promise<void> {
     await persistTasks();
     return;
   }
+  if (email.status === "banned") {
+    task.status = "failed";
+    task.error = "邮箱已标记封号，跳过任务";
+    task.finishedAt = nowIso();
+    task.updatedAt = nowIso();
+    appendLog(task, "error", task.error);
+    await persistTasks();
+    return;
+  }
 
   task.status = "running";
   task.startedAt = nowIso();
@@ -2113,42 +2756,8 @@ async function runTask(task: K12Task): Promise<void> {
     process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
     await ensureSentinelSdk();
 
-    const {OpenAIClient, generateRandomDeviceProfile, Sub2ApiClient, MailboxUrlCodeProvider} = await loadBundleModules();
-    const mailboxProvider = new MailboxUrlCodeProvider(email.mailboxUrl);
-    let baseline: unknown = null;
-    try {
-      baseline = await mailboxProvider.snapshot();
-      appendLog(task, "info", "邮箱基线已读取，等待新验证码");
-    } catch (error) {
-      appendLog(task, "warn", `邮箱基线读取失败，将直接轮询新验证码: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    const fetchOtp = async (label: string) => {
-      appendLog(task, "info", `等待 ${label} 验证码: ${email.email}`);
-      const code = await mailboxProvider.waitForCode({
-        baseline,
-        timeoutMs: 120000,
-        intervalMs: 3000,
-        allowBaselineCodeAfterMs: 45000,
-      });
-      appendLog(task, "ok", `${label} 验证码已获取`);
-      try {
-        baseline = await mailboxProvider.snapshot();
-      } catch {
-        // Baseline refresh is best effort only.
-      }
-      return code;
-    };
-
-    const client = new OpenAIClient({
-      email: email.email,
-      password: appConfig.defaultPassword,
-      deviceProfile: generateRandomDeviceProfile(),
-      signupScreenHint: "signup",
-      bindEmail: email.email,
-      fetchEmailOtp: () => fetchOtp("登录"),
-      fetchAddEmailOtp: () => fetchOtp("绑定邮箱"),
-    });
+    const {Sub2ApiClient} = await loadBundleModules();
+    const client = await createOpenAIClientForEmail(task, email);
 
     let accessToken = "";
     if (task.runWorkspaceJoin) {
@@ -2243,8 +2852,134 @@ async function runTask(task: K12Task): Promise<void> {
     const message = normalizeFlowError(error);
     task.status = task.cancelRequested ? "canceled" : "failed";
     task.error = message;
-    email.status = task.status === "canceled" ? "free" : "failed";
-    email.lastError = message;
+    if (isOpenAiAccountBannedMessage(message)) {
+      markEmailBanned(email, message, task);
+    } else {
+      email.status = task.status === "canceled" ? "free" : "failed";
+      email.lastError = message;
+    }
+    appendLog(task, task.status === "canceled" ? "warn" : "error", message);
+  } finally {
+    task.finishedAt = nowIso();
+    task.updatedAt = nowIso();
+    email.updatedAt = nowIso();
+    activeWorkers = Math.max(0, activeWorkers - 1);
+    await Promise.all([persistTasks(), persistEmails()]);
+    scheduleTasks();
+  }
+}
+
+async function runAtRepairTask(task: K12Task): Promise<void> {
+  const email = emails.find((item) => item.id === task.emailId);
+  if (!email) {
+    task.status = "failed";
+    task.error = "邮箱记录不存在";
+    task.finishedAt = nowIso();
+    await persistTasks();
+    return;
+  }
+  if (email.status === "banned") {
+    task.status = "failed";
+    task.error = "邮箱已标记封号，跳过 AT 修复";
+    task.finishedAt = nowIso();
+    task.updatedAt = nowIso();
+    appendLog(task, "error", task.error);
+    await persistTasks();
+    return;
+  }
+
+  task.status = "running";
+  task.startedAt = nowIso();
+  task.updatedAt = nowIso();
+  email.status = "running";
+  email.lastTaskId = task.id;
+  email.lastError = "";
+  await Promise.all([persistTasks(), persistEmails()]);
+
+  try {
+    process.env.OPENAI_PROXY_URL = appConfig.defaultProxyUrl || "direct";
+    process.env.DEFAULT_PROXY_URL = appConfig.defaultProxyUrl || "direct";
+    process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
+
+    const {origin, token: adminToken} = await loginSub2ApiAdmin();
+    const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName);
+    appendLog(task, "info", `按名称查找 Sub2API 账号: ${names.join(" / ")}`);
+    const account = await findSub2ApiAccountByName(origin, adminToken, names);
+    if (!account) {
+      appendLog(task, "warn", `Sub2API 未找到账号，改为重新获取 K12 AT 后新增账号: ${names.join(" / ")}`);
+      const client = await createOpenAIClientForEmail(task, email);
+      let newAccessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+      newAccessToken = await ensureK12AccessTokenForNoRt(client, task, newAccessToken);
+      recordAccessToken(task, email, newAccessToken);
+      await appendTokenOut(newAccessToken);
+      const createdName = await createSub2ApiNoRtAccountFromAccessToken(task, email, newAccessToken);
+      task.sub2apiAccount = createdName;
+      email.sub2apiAccount = createdName;
+      task.status = "success";
+      email.status = "success";
+      appendLog(task, "ok", `Sub2API 未有旧账号，已新增账号: ${createdName}`);
+      return;
+    }
+
+    const accountId = sub2ApiAccountId(account);
+    const accountName = sub2ApiAccountName(account);
+    if (!accountId) throw new Error(`Sub2API 账号缺少 id: ${accountName || "(unknown)"}`);
+    task.sub2apiAccount = accountName;
+    email.sub2apiAccount = accountName;
+    appendLog(task, "info", `已找到 Sub2API 账号: ${accountName}#${accountId}`);
+
+    const credentials = sub2ApiAccountCredentials(account);
+    const oldAccessToken = extractAccessTokenFromCredentials(credentials);
+    if (oldAccessToken) {
+      const local = await testOpenAiAccessToken(oldAccessToken);
+      appendLog(task, local.ok ? "ok" : "warn", `当前 AT 在线检验: ${local.message}`);
+      if (local.banned) {
+        markEmailBanned(email, "GPT 账号已被 OpenAI 停用/封禁，停止 AT 修复", task);
+        task.status = "failed";
+        return;
+      }
+      if (local.ok) {
+        recordAccessToken(task, email, oldAccessToken);
+        task.status = "success";
+        email.status = "success";
+        appendLog(task, "ok", "当前 AT 仍可用，无需更新 Sub2API");
+        return;
+      }
+    } else {
+      appendLog(task, "warn", "Sub2API 账号缺少 credentials.access_token，准备重新获取");
+    }
+
+    const sub2apiTest = await testSub2ApiAccountLiveness(origin, adminToken, accountId);
+    appendLog(task, sub2apiTest.ok ? "ok" : "warn", `Sub2API 账号测活: ${sub2apiTest.message}`);
+    if (sub2apiTest.ok && oldAccessToken) {
+      recordAccessToken(task, email, oldAccessToken);
+      task.status = "success";
+      email.status = "success";
+      appendLog(task, "ok", "Sub2API 测活通过，无需更新");
+      return;
+    }
+
+    appendLog(task, "warn", "AT 不可用，开始重新登录获取新 K12 AT");
+    const client = await createOpenAIClientForEmail(task, email);
+    let newAccessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+    newAccessToken = await ensureK12AccessTokenForNoRt(client, task, newAccessToken);
+    recordAccessToken(task, email, newAccessToken);
+    await appendTokenOut(newAccessToken);
+
+    await updateSub2ApiAccountAccessToken(origin, adminToken, account, email, newAccessToken);
+    appendLog(task, "ok", `Sub2API 账号 AT 已更新: ${accountName}#${accountId}`);
+    task.status = "success";
+    email.status = "success";
+  } catch (error) {
+    const message = normalizeFlowError(error);
+    task.status = task.cancelRequested ? "canceled" : "failed";
+    task.error = message;
+    if (isOpenAiAccountBannedMessage(message)) {
+      markEmailBanned(email, message, task);
+    } else {
+      email.status = task.status === "canceled" ? "free" : "failed";
+      email.lastError = message;
+    }
     appendLog(task, task.status === "canceled" ? "warn" : "error", message);
   } finally {
     task.finishedAt = nowIso();
@@ -2258,6 +2993,16 @@ async function runTask(task: K12Task): Promise<void> {
 
 function scheduleTasks(): void {
   const limit = Math.max(1, appConfig.taskConcurrency);
+  for (const task of tasks) {
+    if (task.status !== "queued") continue;
+    const email = emails.find((item) => item.id === task.emailId);
+    if (email?.status !== "banned") continue;
+    task.status = "failed";
+    task.error = email.lastError || "邮箱已标记封号，队列任务跳过";
+    task.finishedAt = nowIso();
+    task.updatedAt = nowIso();
+    appendLog(task, "error", task.error);
+  }
   while (activeWorkers < limit) {
     const activeRoots = new Set(
       tasks
@@ -2267,12 +3012,13 @@ function scheduleTasks(): void {
     const task = tasks.find((item) => (
       item.status === "queued"
       && !item.cancelRequested
+      && emails.find((email) => email.id === item.emailId)?.status !== "banned"
       && !activeRoots.has(rootMailboxIdentityByEmailId(item.emailId))
     ));
     if (!task) break;
     activeRoots.add(rootMailboxIdentityByEmailId(task.emailId));
     activeWorkers += 1;
-    void runTask(task);
+    void (task.kind === "at-repair" ? runAtRepairTask(task) : runTask(task));
   }
 }
 
@@ -2296,12 +3042,13 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
   let skippedRunning = 0;
 
   for (const email of selectedEmails.slice(0, limit)) {
-    if (email.status === "running" || hasActiveTask(email.id)) {
+    if (email.status === "running" || email.status === "banned" || hasActiveTask(email.id)) {
       skippedRunning += 1;
       continue;
     }
     const task: K12Task = {
       id: `k12_${Date.now()}_${randomUUID().slice(0, 8)}`,
+      kind: "k12",
       emailId: email.id,
       email: email.email,
       status: "queued",
@@ -2326,6 +3073,53 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
   return {created, skippedRunning, missing};
 }
 
+function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]; skippedRunning: number; missing: number; skippedNoAccount: number} {
+  const requestedEmailIds = Array.isArray(body.emailIds)
+    ? body.emailIds.map((item) => String(item)).filter(Boolean)
+    : [];
+  const requested = new Set(requestedEmailIds);
+  const existingIds = new Set(emails.map((item) => item.id));
+  const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
+  const selectedEmails = emails.filter((item) => requested.has(item.id));
+  const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
+  const created: K12Task[] = [];
+  let skippedRunning = 0;
+  let skippedNoAccount = 0;
+
+  for (const email of selectedEmails) {
+    if (email.status === "running" || email.status === "banned" || hasActiveTask(email.id)) {
+      skippedRunning += 1;
+      continue;
+    }
+    const task: K12Task = {
+      id: `at_repair_${Date.now()}_${randomUUID().slice(0, 8)}`,
+      kind: "at-repair",
+      emailId: email.id,
+      email: email.email,
+      status: "queued",
+      route: appConfig.route,
+      workspaceIds: appConfig.workspaceIds,
+      runWorkspaceJoin: false,
+      runSub2Api: false,
+      sub2apiGroupName,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      workspaceResults: [],
+      logs: [],
+    };
+    appendLog(task, "info", `AT 修复已排队: ${email.email}`);
+    tasks.push(task);
+    email.status = "running";
+    email.lastTaskId = task.id;
+    email.lastError = "";
+    created.push(task);
+  }
+
+  void Promise.all([persistTasks(), persistEmails()]);
+  scheduleTasks();
+  return {created, skippedRunning, missing, skippedNoAccount};
+}
+
 function retryTask(source: K12Task): K12Task {
   if (!["failed", "canceled"].includes(source.status)) {
     throw new Error("只能重试失败或已取消的任务");
@@ -2333,9 +3127,11 @@ function retryTask(source: K12Task): K12Task {
   const email = emails.find((item) => item.id === source.emailId);
   if (!email) throw new Error("邮箱记录不存在");
   if (email.status === "running") throw new Error("该邮箱当前正在运行，不能重复重试");
+  if (email.status === "banned") throw new Error("该邮箱已标记封号，不能重试");
 
   const task: K12Task = {
     id: `k12_${Date.now()}_${randomUUID().slice(0, 8)}`,
+    kind: source.kind || "k12",
     emailId: source.emailId,
     email: source.email,
     status: "queued",
@@ -2359,6 +3155,20 @@ function retryTask(source: K12Task): K12Task {
   return task;
 }
 
+function clearFailedTasks(): {removed: number} {
+  const failedTasks = tasks.filter((task) => task.status === "failed");
+  if (!failedTasks.length) return {removed: 0};
+  const removedIds = new Set(failedTasks.map((task) => task.id));
+  tasks = tasks.filter((task) => !removedIds.has(task.id));
+  for (const email of emails) {
+    if (email.lastTaskId && removedIds.has(email.lastTaskId)) {
+      delete email.lastTaskId;
+      email.updatedAt = nowIso();
+    }
+  }
+  return {removed: removedIds.size};
+}
+
 function publicTask(task: K12Task): Record<string, unknown> {
   return {
     ...task,
@@ -2375,6 +3185,7 @@ function summary(): Record<string, unknown> {
       running: countByStatus(emails, "running"),
       success: countByStatus(emails, "success"),
       failed: countByStatus(emails, "failed"),
+      banned: countByStatus(emails, "banned"),
     },
     tasks: {
       total: tasks.length,
@@ -2391,6 +3202,7 @@ function summary(): Record<string, unknown> {
 function reconcileEmailStatusesFromTasks(): boolean {
   let changed = false;
   for (const email of emails) {
+    if (email.status === "banned") continue;
     const related = tasks
       .filter((task) => task.emailId === email.id)
       .sort((a, b) => String(b.finishedAt || b.updatedAt || b.createdAt).localeCompare(String(a.finishedAt || a.updatedAt || a.createdAt)));
@@ -2571,9 +3383,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     let ids = Array.isArray(body.ids) ? body.ids.map((item) => String(item)).filter(Boolean) : [];
     const status = asString(body.status);
     if (status) {
-      const allowed = new Set(["free", "failed", "success"]);
+      const allowed = new Set(["free", "failed", "success", "banned"]);
       if (!allowed.has(status)) {
-        sendJson(res, 400, {error: "status 只能是 free、failed 或 success"});
+        sendJson(res, 400, {error: "status 只能是 free、failed、success 或 banned"});
         return;
       }
       ids = emails.filter((item) => item.status === status).map((item) => item.id);
@@ -2595,6 +3407,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     const result = splitEmails(ids, count);
     await persistEmails();
     sendJson(res, 200, {...result, total: emails.length});
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/emails/check-at") {
+    const body = await readJsonBody(req);
+    try {
+      const result = await checkSub2ApiAccessTokens(body);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, {error: error instanceof Error ? error.message : String(error)});
+    }
     return;
   }
 
@@ -2626,7 +3449,37 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
-  const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(cancel|retry))?$/);
+  if (method === "POST" && pathname === "/api/tasks/repair-at") {
+    const body = await readJsonBody(req);
+    const result = createAtRepairTasks(body);
+    sendJson(res, 201, {
+      tasks: result.created.map(publicTask),
+      skippedRunning: result.skippedRunning,
+      missing: result.missing,
+      skippedNoAccount: result.skippedNoAccount,
+    });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/tasks/check-at") {
+    const body = await readJsonBody(req);
+    try {
+      const result = await checkTaskAccessTokens(body);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, {error: error instanceof Error ? error.message : String(error)});
+    }
+    return;
+  }
+
+  if (method === "POST" && pathname === "/api/tasks/clear-failed") {
+    const result = clearFailedTasks();
+    await Promise.all([persistTasks(), persistEmails()]);
+    sendJson(res, 200, result);
+    return;
+  }
+
+  const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(cancel|retry|check-at))?$/);
   if (taskMatch) {
     const task = tasks.find((item) => item.id === decodeURIComponent(taskMatch[1]));
     if (!task) {
@@ -2650,6 +3503,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       try {
         const created = retryTask(task);
         sendJson(res, 201, {task: publicTask(created)});
+      } catch (error) {
+        sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
+      }
+      return;
+    }
+    if (method === "POST" && taskMatch[2] === "check-at") {
+      try {
+        const result = await checkTaskAccessToken(task);
+        sendJson(res, 200, result);
       } catch (error) {
         sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
       }
