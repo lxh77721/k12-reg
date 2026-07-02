@@ -25,6 +25,7 @@ interface AppConfig {
   taskConcurrency: number;
   runWorkspaceJoin: boolean;
   runSub2Api: boolean;
+  sub2apiNoRtMode: boolean;
   sub2apiUrl: string;
   sub2apiEmail: string;
   sub2apiPassword: string;
@@ -81,6 +82,7 @@ interface K12Task {
   workspaceIds: string[];
   runWorkspaceJoin: boolean;
   runSub2Api: boolean;
+  sub2apiNoRtMode?: boolean;
   sub2apiGroupName: string;
   createdAt: string;
   updatedAt: string;
@@ -328,6 +330,7 @@ async function defaultConfig(): Promise<AppConfig> {
     taskConcurrency: 1,
     runWorkspaceJoin: true,
     runSub2Api: true,
+    sub2apiNoRtMode: false,
     sub2apiUrl: asString(ref.sub2apiUrl, ""),
     sub2apiEmail: asString(ref.sub2apiEmail, ""),
     sub2apiPassword: asString(ref.sub2apiPassword, ""),
@@ -365,6 +368,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     taskConcurrency: asNumber(raw.taskConcurrency, 1, 1, 10),
     runWorkspaceJoin: asBoolean(raw.runWorkspaceJoin, true),
     runSub2Api: asBoolean(raw.runSub2Api, true),
+    sub2apiNoRtMode: asBoolean(raw.sub2apiNoRtMode, false),
     sub2apiUrl: asString(raw.sub2apiUrl),
     sub2apiEmail: asString(raw.sub2apiEmail),
     sub2apiPassword: String(raw.sub2apiPassword || ""),
@@ -391,6 +395,7 @@ async function ensureCompatBundleConfig(): Promise<void> {
     defaultPassword: appConfig.defaultPassword,
     defaultProxyUrl: appConfig.defaultProxyUrl,
     mailApiBaseUrl: appConfig.mailApiBaseUrl,
+    sub2apiNoRtMode: appConfig.sub2apiNoRtMode,
     sub2apiUrl: appConfig.sub2apiUrl,
     sub2apiEmail: appConfig.sub2apiEmail,
     sub2apiPassword: appConfig.sub2apiPassword,
@@ -583,6 +588,7 @@ function normalizeImportedTask(value: unknown): K12Task | null {
     workspaceIds: parseStringList(record.workspaceIds),
     runWorkspaceJoin: asBoolean(record.runWorkspaceJoin, true),
     runSub2Api: asBoolean(record.runSub2Api, true),
+    sub2apiNoRtMode: asBoolean(record.sub2apiNoRtMode, false),
     sub2apiGroupName: asString(record.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12",
     createdAt: asString(record.createdAt) || nowIso(),
     updatedAt: asString(record.updatedAt) || nowIso(),
@@ -1764,10 +1770,13 @@ async function ensureK12AccessTokenForNoRt(client: any, task: K12Task, accessTok
   appendLog(task, "warn", `当前 AT 不是 K12 上下文，不能直接 noRT 入库: ${describeAccessTokenContext(accessToken)}`);
   let latestToken = accessToken;
   for (const workspaceId of targetK12WorkspaceIds(task)) {
-    const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
-    task.workspaceResults.push(result);
-    await persistTasks();
-    if (!result.ok) continue;
+    const existingOk = task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route && item.ok);
+    if (!existingOk) {
+      const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
+      task.workspaceResults.push(result);
+      await persistTasks();
+      if (!result.ok) continue;
+    }
     await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
     latestToken = await switchToK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
     if (isK12AccessToken(latestToken, task)) return latestToken;
@@ -2429,6 +2438,53 @@ async function createSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: Ema
   return accountName;
 }
 
+async function upsertSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: EmailRecord, accessToken: string): Promise<string> {
+  const groupName = task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12";
+  const accountName = `${email.email}--noRT`;
+  const {origin, token: adminToken} = await loginSub2ApiAdmin();
+  const existing = await findSub2ApiAccountByName(origin, adminToken, [accountName]);
+  if (existing) {
+    await updateSub2ApiAccountAccessToken(origin, adminToken, existing, email, accessToken);
+    appendLog(task, "ok", `Sub2API noRT 账号已存在，已更新 AT: ${accountName}`);
+    return accountName;
+  }
+
+  const groupsData = await requestSub2ApiJson(origin, "/api/v1/admin/groups/all", {token: adminToken});
+  const groups = Array.isArray(groupsData) ? groupsData : [];
+  const group = groups.find((item) => {
+    const record = item as Record<string, unknown>;
+    const name = asString(record.name).toLowerCase();
+    const platform = asString(record.platform).toLowerCase();
+    return name === groupName.toLowerCase() && (!platform || platform === "openai");
+  }) as Record<string, unknown> | undefined;
+  const groupId = Number(group?.id);
+  if (!Number.isSafeInteger(groupId) || groupId <= 0) {
+    throw new Error(`Sub2API 未找到 openai 分组: ${groupName}`);
+  }
+
+  const credentials = buildSub2ApiCredentialsFromAccessToken(accessToken, email.email);
+  await requestSub2ApiJson(origin, "/api/v1/admin/accounts", {
+    method: "POST",
+    token: adminToken,
+    body: {
+      name: accountName,
+      notes: "noRT mode: imported K12 access_token only, no refresh_token",
+      platform: "openai",
+      type: "oauth",
+      credentials,
+      concurrency: appConfig.sub2apiConcurrency,
+      priority: appConfig.sub2apiAccountPriority,
+      rate_multiplier: 1,
+      group_ids: [groupId],
+      auto_pause_on_expired: true,
+      extra: {email: credentials.email || email.email, no_rt: true, source: "ai-gpt-k12-nort-mode"},
+    },
+    timeoutMs: 60000,
+  });
+  appendLog(task, "ok", `Sub2API noRT 账号已创建: ${accountName} (${groupName}#${groupId})`);
+  return accountName;
+}
+
 async function getAuthSessionCandidates(client: any): Promise<Record<string, unknown>[]> {
   const candidates: Record<string, unknown>[] = [];
   if (typeof client.readCookie !== "function") return candidates;
@@ -2886,6 +2942,31 @@ async function loginViaSub2ApiAuthorizeUrl(client: any, authorizeUrl: string, ta
   return followToLocalhostCallback(client, currentUrl, task);
 }
 
+async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecord, accessToken: string): Promise<string> {
+  if (!task.runWorkspaceJoin) return accessToken;
+  if (!accessToken) {
+    throw new Error("K12 空间执行需要 AT：请启用 Sub2API OAuth，或先建立 ChatGPT Web session 后从 /api/auth/session 获取 accessToken");
+  }
+  let latestToken = accessToken;
+  for (const workspaceId of task.workspaceIds) {
+    if (task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route)) continue;
+    const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
+    task.workspaceResults.push(result);
+    await persistTasks();
+    if (result.ok) {
+      await checkK12WorkspaceMembership(client, task, latestToken, workspaceId);
+      const switchedToken = await switchToK12WorkspaceAccessToken(client, task, latestToken, workspaceId);
+      if (switchedToken !== latestToken) {
+        latestToken = switchedToken;
+        recordAccessToken(task, email, latestToken);
+        await appendTokenOut(latestToken);
+      }
+    }
+    if (task.workspaceIds.length > 1) await sleep(appConfig.joinIntervalMs);
+  }
+  return latestToken;
+}
+
 async function runTask(task: K12Task): Promise<void> {
   const email = emails.find((item) => item.id === task.emailId);
   if (!email) {
@@ -2919,8 +3000,8 @@ async function runTask(task: K12Task): Promise<void> {
     process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
     await ensureSentinelSdk();
 
-    const {Sub2ApiClient} = await loadBundleModules();
     const client = await createOpenAIClientForEmail(task, email);
+    const useNoRtMode = task.sub2apiNoRtMode === true;
 
     let accessToken = "";
     if (task.runWorkspaceJoin) {
@@ -2934,78 +3015,77 @@ async function runTask(task: K12Task): Promise<void> {
       if (!appConfig.sub2apiUrl || !appConfig.sub2apiEmail || !appConfig.sub2apiPassword) {
         throw new Error("Sub2API 配置不完整：地址、账号、密码均不能为空");
       }
-      try {
-        appendLog(task, "info", `Sub2API OA 授权入库，分组 ${task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12"}`);
-        const sub2api = new Sub2ApiClient({
-          url: appConfig.sub2apiUrl,
-          email: appConfig.sub2apiEmail,
-          password: appConfig.sub2apiPassword,
-          groupName: task.sub2apiGroupName || appConfig.sub2apiGroupName,
-          groupNames: [task.sub2apiGroupName || appConfig.sub2apiGroupName],
-          proxyName: appConfig.sub2apiProxyName,
-          accountPriority: appConfig.sub2apiAccountPriority,
-          concurrency: appConfig.sub2apiConcurrency,
-        });
-        const prepared = await sub2api.prepareOpenAiOAuth();
-        appendLog(task, "info", `Sub2API OAuth URL 已生成: ${prepared.groupLabel}`);
-        const callbackUrl = await loginViaSub2ApiAuthorizeUrl(client, prepared.oauthUrl, task);
-        appendLog(task, "info", "OAuth callback 已获取，交给 Sub2API exchange-code");
-        const accountName = `${email.email}---${task.sub2apiGroupName || appConfig.sub2apiGroupName}`;
-        const created = await sub2api.exchangeCallbackAndCreateAccount(
-          prepared,
-          callbackUrl,
-          email.email,
-          accountName,
-          {requireChatgptAccountId: appConfig.requireChatgptAccountId},
-        );
-        task.sub2apiAccount = created.accountName;
-        email.sub2apiAccount = created.accountName;
-        appendLog(task, "ok", `Sub2API 账号已创建: ${created.accountName}`);
-        if (!accessToken) {
-          accessToken = extractAccessTokenFromCredentials(created.credentials || {});
-          if (!accessToken) {
-            throw new Error("Sub2API OAuth 已完成，但 exchange-code 返回中缺少 access_token");
-          }
-          recordAccessToken(task, email, accessToken);
-          await appendTokenOut(accessToken);
-        }
-      } catch (error) {
-        if (!isAddPhoneFlowError(error)) throw error;
-        appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
+      if (useNoRtMode) {
+        appendLog(task, "info", "Sub2API noRT 模式已开启：跳过 OAuth，先加入/切换 K12，再用 K12 AT 入库");
         if (!accessToken) {
           accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
           recordAccessToken(task, email, accessToken);
           await appendTokenOut(accessToken);
         }
+        accessToken = await runK12WorkspaceJoin(client, task, email, accessToken);
         accessToken = await ensureK12AccessTokenForNoRt(client, task, accessToken);
         recordAccessToken(task, email, accessToken);
         await appendTokenOut(accessToken);
-        const accountName = await createSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
+        const accountName = await upsertSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
         task.sub2apiAccount = accountName;
         email.sub2apiAccount = accountName;
-      }
-    }
-
-    if (task.runWorkspaceJoin) {
-      if (!accessToken) {
-        throw new Error("K12 空间执行需要 AT：请启用 Sub2API OAuth，或先建立 ChatGPT Web session 后从 /api/auth/session 获取 accessToken");
-      }
-      for (const workspaceId of task.workspaceIds) {
-        if (task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route)) continue;
-        const result = await sendK12Invite(task, client, accessToken, workspaceId, task.route);
-        task.workspaceResults.push(result);
-        await persistTasks();
-        if (result.ok) {
-          await checkK12WorkspaceMembership(client, task, accessToken, workspaceId);
-          const switchedToken = await switchToK12WorkspaceAccessToken(client, task, accessToken, workspaceId);
-          if (switchedToken !== accessToken) {
-            accessToken = switchedToken;
+      } else {
+        try {
+          const {Sub2ApiClient} = await loadBundleModules();
+          appendLog(task, "info", `Sub2API OA 授权入库，分组 ${task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12"}`);
+          const sub2api = new Sub2ApiClient({
+            url: appConfig.sub2apiUrl,
+            email: appConfig.sub2apiEmail,
+            password: appConfig.sub2apiPassword,
+            groupName: task.sub2apiGroupName || appConfig.sub2apiGroupName,
+            groupNames: [task.sub2apiGroupName || appConfig.sub2apiGroupName],
+            proxyName: appConfig.sub2apiProxyName,
+            accountPriority: appConfig.sub2apiAccountPriority,
+            concurrency: appConfig.sub2apiConcurrency,
+          });
+          const prepared = await sub2api.prepareOpenAiOAuth();
+          appendLog(task, "info", `Sub2API OAuth URL 已生成: ${prepared.groupLabel}`);
+          const callbackUrl = await loginViaSub2ApiAuthorizeUrl(client, prepared.oauthUrl, task);
+          appendLog(task, "info", "OAuth callback 已获取，交给 Sub2API exchange-code");
+          const accountName = `${email.email}---${task.sub2apiGroupName || appConfig.sub2apiGroupName}`;
+          const created = await sub2api.exchangeCallbackAndCreateAccount(
+            prepared,
+            callbackUrl,
+            email.email,
+            accountName,
+            {requireChatgptAccountId: appConfig.requireChatgptAccountId},
+          );
+          task.sub2apiAccount = created.accountName;
+          email.sub2apiAccount = created.accountName;
+          appendLog(task, "ok", `Sub2API 账号已创建: ${created.accountName}`);
+          if (!accessToken) {
+            accessToken = extractAccessTokenFromCredentials(created.credentials || {});
+            if (!accessToken) {
+              throw new Error("Sub2API OAuth 已完成，但 exchange-code 返回中缺少 access_token");
+            }
             recordAccessToken(task, email, accessToken);
             await appendTokenOut(accessToken);
           }
+        } catch (error) {
+          if (!isAddPhoneFlowError(error)) throw error;
+          appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
+          if (!accessToken) {
+            accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+            recordAccessToken(task, email, accessToken);
+            await appendTokenOut(accessToken);
+          }
+          accessToken = await ensureK12AccessTokenForNoRt(client, task, accessToken);
+          recordAccessToken(task, email, accessToken);
+          await appendTokenOut(accessToken);
+          const accountName = await createSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
+          task.sub2apiAccount = accountName;
+          email.sub2apiAccount = accountName;
         }
-        if (task.workspaceIds.length > 1) await sleep(appConfig.joinIntervalMs);
       }
+    }
+
+    if (task.runWorkspaceJoin && !useNoRtMode) {
+      accessToken = await runK12WorkspaceJoin(client, task, email, accessToken);
     }
 
     task.status = "success";
@@ -3198,8 +3278,9 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
   const limit = asNumber(body.count, selectedEmails.length || 1, 1, 500);
   const workspaceCandidates = uniqueStringList(parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : appConfig.workspaceIds);
   const route = body.route === "accept" ? "accept" : appConfig.route;
-  const runWorkspaceJoin = asBoolean(body.runWorkspaceJoin, appConfig.runWorkspaceJoin);
   const runSub2Api = asBoolean(body.runSub2Api, appConfig.runSub2Api);
+  const sub2apiNoRtMode = runSub2Api && asBoolean(body.sub2apiNoRtMode, appConfig.sub2apiNoRtMode);
+  const runWorkspaceJoin = sub2apiNoRtMode ? true : asBoolean(body.runWorkspaceJoin, appConfig.runWorkspaceJoin);
   const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
   const created: K12Task[] = [];
   let skippedRunning = 0;
@@ -3221,6 +3302,7 @@ function createTasks(body: Record<string, unknown>): {created: K12Task[]; skippe
       workspaceIds: taskWorkspaceIds,
       runWorkspaceJoin,
       runSub2Api,
+      sub2apiNoRtMode,
       sub2apiGroupName,
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -3308,6 +3390,7 @@ function retryTask(source: K12Task): K12Task {
     workspaceIds: source.workspaceIds,
     runWorkspaceJoin: source.runWorkspaceJoin,
     runSub2Api: source.runSub2Api,
+    sub2apiNoRtMode: source.sub2apiNoRtMode === true,
     sub2apiGroupName: source.sub2apiGroupName || appConfig.sub2apiGroupName || "k12",
     createdAt: nowIso(),
     updatedAt: nowIso(),

@@ -213,6 +213,13 @@
                     <small>只拿邮箱 OA 到 Sub2API 的流程，分组默认 k12。</small>
                   </span>
                 </label>
+                <label class="switch-card">
+                  <input v-model="form.sub2apiNoRtMode" type="checkbox" />
+                  <span>
+                    <strong>noRT 直入模式</strong>
+                    <small>开启后跳过 Sub2API OAuth：注册/登录 → 加入并切到 K12 → 用 K12 AT 创建或更新 --noRT 账号。</small>
+                  </span>
+                </label>
               </div>
               <div class="compact-grid">
                 <label class="field">
@@ -592,6 +599,7 @@ const form = reactive({
   taskConcurrency: 1,
   runWorkspaceJoin: true,
   runSub2Api: true,
+  sub2apiNoRtMode: false,
   sub2apiUrl: "",
   sub2apiEmail: "",
   sub2apiPassword: "",
@@ -667,6 +675,7 @@ async function loadConfig() {
     taskConcurrency: config.taskConcurrency || 1,
     runWorkspaceJoin: config.runWorkspaceJoin !== false,
     runSub2Api: config.runSub2Api !== false,
+    sub2apiNoRtMode: config.sub2apiNoRtMode === true,
     sub2apiUrl: config.sub2apiUrl || "",
     sub2apiEmail: config.sub2apiEmail || "",
     sub2apiPassword: "",
@@ -940,6 +949,7 @@ async function startSelectedEmailTasks() {
       route: form.route,
       runWorkspaceJoin: form.runWorkspaceJoin,
       runSub2Api: form.runSub2Api,
+      sub2apiNoRtMode: form.sub2apiNoRtMode,
       sub2apiGroupName: form.sub2apiGroupName || "k12",
     }),
   });
@@ -1028,6 +1038,7 @@ async function startTasks() {
       route: form.route,
       runWorkspaceJoin: form.runWorkspaceJoin,
       runSub2Api: form.runSub2Api,
+      sub2apiNoRtMode: form.sub2apiNoRtMode,
       sub2apiGroupName: form.sub2apiGroupName || "k12",
     }),
   });
