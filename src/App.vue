@@ -234,7 +234,9 @@
 
           <div class="modal-footer">
             <p class="hint">配置默认从本项目 <code>codex_register/config.json</code> 读取，保存后写入本项目 <code>data/config.json</code>。</p>
-            <button class="primary" @click="saveConfig">保存配置</button>
+            <button class="primary" :disabled="savingConfig" @click="saveConfig">
+              {{ savingConfig ? "保存中..." : "保存配置" }}
+            </button>
           </div>
         </section>
       </div>
@@ -452,6 +454,7 @@ const importResult = ref("");
 const workspaceText = ref("");
 const runCount = ref(1);
 const toast = ref("");
+const savingConfig = ref(false);
 const showSettingsModal = ref(false);
 const showEmailImportModal = ref(false);
 const showEmailPoolModal = ref(false);
@@ -541,13 +544,24 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
-  const payload = {
-    ...form,
-    workspaceIds: parseWorkspaceIds(workspaceText.value),
-  };
-  await api("/api/config", {method: "PATCH", body: JSON.stringify(payload)});
-  await loadConfig();
-  showToast("配置已保存");
+  if (savingConfig.value) return false;
+  savingConfig.value = true;
+  try {
+    const payload = {
+      ...form,
+      workspaceIds: parseWorkspaceIds(workspaceText.value),
+    };
+    await api("/api/config", {method: "PATCH", body: JSON.stringify(payload)});
+    await Promise.all([loadConfig(), loadSummary()]);
+    showSettingsModal.value = false;
+    showToast("配置已保存");
+    return true;
+  } catch (error) {
+    showToast(`保存配置失败：${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  } finally {
+    savingConfig.value = false;
+  }
 }
 
 async function loadEmails() {
@@ -610,7 +624,8 @@ async function deleteEmail(id: string) {
 }
 
 async function startTasks() {
-  await saveConfig();
+  const saved = await saveConfig();
+  if (!saved) return;
   const data = await api<any>("/api/tasks", {
     method: "POST",
     body: JSON.stringify({
