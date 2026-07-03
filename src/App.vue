@@ -92,7 +92,7 @@
             {{ busy ? "运行中" : `启动 ${launchTaskCount} 个任务` }}
           </button>
           <span v-if="form.smsBowerMailEnabled" class="launch-mode-badge">
-            SMSBower Gmail 动态模式，不占用邮箱池；开启裂变时，启动数量为母邮箱数
+            {{ form.gmailMailProvider === "emailnator" ? "Emailnator Gmail" : "SMSBower Gmail" }} 动态模式，不占用邮箱池
           </span>
         </div>
       </div>
@@ -115,7 +115,7 @@
           </thead>
           <tbody>
             <tr
-              v-for="task in tasks"
+              v-for="task in pagedTasks"
               :key="task.id"
               :class="['task-row', { active: selectedTask?.id === task.id, selected: selectedTaskIds.includes(task.id) }]"
               @click="openTaskLog(task)"
@@ -183,10 +183,22 @@
               </td>
             </tr>
             <tr v-if="!tasks.length">
-              <td colspan="7" class="empty">暂无任务。导入邮箱后可从上方启动流程。</td>
+              <td colspan="8" class="empty">暂无任务。导入邮箱后可从上方启动流程。</td>
             </tr>
           </tbody>
         </table>
+      </div>
+      <div v-if="tasks.length" class="pagination-bar">
+        <span>
+          共 {{ sortedTasks.length }} 个任务，当前 {{ taskPageStart + 1 }}-{{ taskPageEnd }}
+        </span>
+        <div class="pagination-actions">
+          <button class="ghost small" :disabled="taskPage <= 1" @click="taskPage = 1">首页</button>
+          <button class="ghost small" :disabled="taskPage <= 1" @click="taskPage -= 1">上一页</button>
+          <strong>{{ taskPage }} / {{ taskTotalPages }}</strong>
+          <button class="ghost small" :disabled="taskPage >= taskTotalPages" @click="taskPage += 1">下一页</button>
+          <button class="ghost small" :disabled="taskPage >= taskTotalPages" @click="taskPage = taskTotalPages">末页</button>
+        </div>
       </div>
       <pre v-if="taskCheckResult" class="check-result task-check-result">{{ taskCheckResult }}</pre>
     </section>
@@ -367,21 +379,45 @@
               <label class="switch-card refill-switch">
                 <input v-model="form.smsBowerMailEnabled" type="checkbox" />
                 <span>
-                  <strong>使用 SMSBower 谷歌邮箱</strong>
-                  <small>开启后，未指定邮箱启动任务时动态租 Gmail 接码；关闭时仍按原来的邮箱池流程执行。</small>
+                  <strong>使用动态谷歌邮箱</strong>
+                  <small>开启后，未指定邮箱启动任务时按下方类型动态生成/租 Gmail 接码；关闭时仍按原来的邮箱池流程执行。</small>
                 </span>
               </label>
+              <div class="config-grid refill-config-grid">
+                <label class="field">
+                  <span>谷歌邮箱渠道类型</span>
+                  <select v-model="form.gmailMailProvider">
+                    <option value="smsbower">SMSBower</option>
+                    <option value="emailnator">Emailnator</option>
+                  </select>
+                  <small>只新增 Emailnator 分支；选择 SMSBower 时原租邮箱流程不变。</small>
+                </label>
+                <label class="field" v-if="form.gmailMailProvider === 'emailnator'">
+                  <span>Emailnator 生成类型</span>
+                  <select v-model="form.emailnatorEmailType">
+                    <option value="plusGmail">plusGmail（推荐，稳定 Gmail）</option>
+                    <option value="googleMail">googleMail</option>
+                    <option value="dotGmail">dotGmail</option>
+                    <option value="domain">domain</option>
+                  </select>
+                  <small>按你抓包的稳定请求，默认使用 plusGmail。</small>
+                </label>
+                <label class="field" v-if="form.gmailMailProvider === 'emailnator'">
+                  <span>Emailnator 地址</span>
+                  <input v-model="form.emailnatorBaseUrl" placeholder="https://www.emailnator.com" />
+                </label>
+              </div>
               <p v-if="smsBowerBackendUnsupported" class="inline-alert warn">
                 当前后端未返回 SMSBower 配置字段，说明服务仍在跑旧进程。请重启后端后再保存，否则开关会被旧接口丢弃。
               </p>
-              <label class="switch-card refill-switch">
+              <label v-if="form.gmailMailProvider === 'smsbower'" class="switch-card refill-switch">
                 <input v-model="form.smsBowerGmailFissionEnabled" type="checkbox" />
                 <span>
                   <strong>开启谷歌裂变</strong>
                   <small>母邮箱任务成功后，再逐个创建 +alias 子邮箱任务，避免验证码串号。</small>
                 </span>
               </label>
-              <div class="config-grid refill-config-grid">
+              <div v-if="form.gmailMailProvider === 'smsbower'" class="config-grid refill-config-grid">
                 <label class="field">
                   <span class="field-title-row">
                     SMSBower API Key
@@ -684,8 +720,8 @@
                     </td>
                     <td><span :class="['status', item.status]">{{ statusText(item.status) }}</span></td>
                     <td>
-                      <span :class="['otp-mode-badge', item.otpMode === 'manual' ? 'manual' : 'auto']">
-                        {{ item.otpMode === "manual" ? "手动接码" : "自动接码" }}
+                      <span :class="['otp-mode-badge', item.otpMode === 'manual' ? 'manual' : item.otpMode === 'emailnator' ? 'emailnator' : 'auto']">
+                        {{ item.otpMode === "manual" ? "手动接码" : item.otpMode === "emailnator" ? "Emailnator" : item.otpMode === "smsbower-mail" ? "SMSBower" : "自动接码" }}
                       </span>
                       <small class="muted clipped">{{ item.mailboxUrlMasked }}</small>
                     </td>
@@ -809,7 +845,7 @@
 </template>
 
 <script setup lang="ts">
-import {computed, onMounted, onUnmounted, reactive, ref} from "vue";
+import {computed, onMounted, onUnmounted, reactive, ref, watch} from "vue";
 
 interface EmailItem {
   id: string;
@@ -937,6 +973,8 @@ const accessTokenCheckResult = ref("");
 const taskCheckResult = ref("");
 const selectedEmailIds = ref<string[]>([]);
 const selectedTaskIds = ref<string[]>([]);
+const taskPageSize = 50;
+const taskPage = ref(1);
 const dataImportInput = ref<HTMLInputElement | null>(null);
 const splitAliasCount = ref(4);
 const workspaceText = ref("");
@@ -991,6 +1029,7 @@ const form = reactive({
   sub2apiRefillEmailCount: 5,
   sub2apiRefillIntervalMs: 300000,
   sub2apiRefillDeepCheckEnabled: false,
+  gmailMailProvider: "smsbower",
   smsBowerMailEnabled: false,
   smsBowerApiKey: "",
   smsBowerMailBaseUrl: "https://smsbower.page/api/mail",
@@ -999,6 +1038,8 @@ const form = reactive({
   smsBowerMailMaxPrice: "",
   smsBowerGmailFissionEnabled: false,
   smsBowerGmailFissionCount: 1,
+  emailnatorBaseUrl: "https://www.emailnator.com",
+  emailnatorEmailType: "plusGmail",
   tokenOut: "",
   jsonOutDir: "",
   jsonOutFormat: "sub2api",
@@ -1023,17 +1064,30 @@ const selectedCheckableTaskIds = computed(() => checkableTasks.value
   .map((item) => item.id));
 const allCheckableTasksSelected = computed(() => checkableTasks.value.length > 0 && checkableTasks.value.every((item) => selectedTaskIds.value.includes(item.id)));
 const inactiveMarkedTasks = computed(() => tasks.value.filter((item) => item.accessTokenLiveness === "inactive" || item.accessTokenLiveness === "banned"));
+const sortedTasks = computed(() => {
+  const rank = (status: string) => status === "running" ? 0 : status === "queued" ? 1 : 2;
+  return tasks.value
+    .map((task, index) => ({task, index}))
+    .sort((a, b) => rank(a.task.status) - rank(b.task.status) || a.index - b.index)
+    .map((item) => item.task);
+});
+const taskTotalPages = computed(() => Math.max(1, Math.ceil(sortedTasks.value.length / taskPageSize)));
+const taskPageStart = computed(() => (taskPage.value - 1) * taskPageSize);
+const taskPageEnd = computed(() => Math.min(sortedTasks.value.length, taskPageStart.value + taskPageSize));
+const pagedTasks = computed(() => sortedTasks.value.slice(taskPageStart.value, taskPageEnd.value));
 const selectableParentEmails = computed(() => emails.value.filter((item) => !item.parentEmail && item.status !== "running"));
 const passwordPlaceholder = computed(() => form.sub2apiPassword ? "已填写" : "留空则不修改已保存密码");
 const smsBowerApiKeyPlaceholder = computed(() => form.smsBowerApiKey || smsBowerApiKeySaved.value ? "已设置 Key，留空则不修改" : "填写 SMSBower API Key");
 const smsBowerBalanceText = computed(() => {
   if (!form.smsBowerMailEnabled) return "未启用";
+  if (form.gmailMailProvider === "emailnator") return "Emailnator";
   if (!smsBowerAccount.apiKeyPresent) return "未设置Key";
   if (smsBowerAccount.ok && smsBowerAccount.balance !== undefined) return `${formatMoney(smsBowerAccount.balance)} ${smsBowerAccount.currency || "USD"}`;
   return "获取失败";
 });
 const smsBowerSpendText = computed(() => {
   if (!form.smsBowerMailEnabled) return "动态 Gmail 未启用";
+  if (form.gmailMailProvider === "emailnator") return `免费生成 Gmail：${form.emailnatorEmailType || "plusGmail"}`;
   if (!smsBowerAccount.apiKeyPresent) return "设置页填写 Key 后显示余额";
   const base = `本地花费 ${formatMoney(smsBowerAccount.localSpend)} / 租号 ${smsBowerAccount.rentedCount}`;
   if (!smsBowerAccount.ok && smsBowerAccount.error) return `${base}，${smsBowerAccount.error}`;
@@ -1054,6 +1108,11 @@ const refillSummaryText = computed(() => {
 const emailImportPlaceholder = computed(() => emailImportMode.value === "manual"
   ? "手动接码模式：\nuser1@example.com\nuser2@example.com"
   : "支持：\nemail----password----clientId----refreshToken\nemail-----http://mail-api/api/GetLastEmails?email=...");
+
+watch(taskTotalPages, (pages) => {
+  if (taskPage.value > pages) taskPage.value = pages;
+  if (taskPage.value < 1) taskPage.value = 1;
+}, {immediate: true});
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
@@ -1123,6 +1182,7 @@ async function loadConfig() {
     sub2apiRefillEmailCount: config.sub2apiRefillEmailCount ?? 5,
     sub2apiRefillIntervalMs: config.sub2apiRefillIntervalMs ?? 300000,
     sub2apiRefillDeepCheckEnabled: config.sub2apiRefillDeepCheckEnabled === true,
+    gmailMailProvider: config.gmailMailProvider === "emailnator" ? "emailnator" : "smsbower",
     smsBowerMailEnabled: config.smsBowerMailEnabled === true,
     smsBowerApiKey: "",
     smsBowerMailBaseUrl: config.smsBowerMailBaseUrl || "https://smsbower.page/api/mail",
@@ -1131,6 +1191,8 @@ async function loadConfig() {
     smsBowerMailMaxPrice: config.smsBowerMailMaxPrice || "",
     smsBowerGmailFissionEnabled: config.smsBowerGmailFissionEnabled === true,
     smsBowerGmailFissionCount: config.smsBowerGmailFissionCount ?? 1,
+    emailnatorBaseUrl: config.emailnatorBaseUrl || "https://www.emailnator.com",
+    emailnatorEmailType: config.emailnatorEmailType || "plusGmail",
     tokenOut: config.tokenOut || "",
     jsonOutDir: config.jsonOutDir || "",
     jsonOutFormat: config.jsonOutFormat === "cpa" ? "cpa" : "sub2api",
@@ -1179,7 +1241,7 @@ async function saveConfig() {
       throw new Error("SMSBower Gmail 开关未保存成功，请重启后端后重试。");
     }
     showSettingsModal.value = false;
-    showToast(`配置已保存${form.smsBowerMailEnabled ? "：SMSBower Gmail 已启用" : ""}`);
+    showToast(`配置已保存${form.smsBowerMailEnabled ? `：${form.gmailMailProvider === "emailnator" ? "Emailnator Gmail" : "SMSBower Gmail"} 已启用` : ""}`);
     return true;
   } catch (error) {
     showToast(`保存配置失败：${error instanceof Error ? error.message : String(error)}`);
@@ -1244,7 +1306,7 @@ async function loadTasks() {
   if (selectedTask.value) {
     selectedTask.value = tasks.value.find((item) => item.id === selectedTask.value?.id) || selectedTask.value;
   } else if (tasks.value.length) {
-    selectedTask.value = tasks.value[0];
+    selectedTask.value = sortedTasks.value[0];
   }
 }
 

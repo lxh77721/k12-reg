@@ -11,7 +11,8 @@ type TaskStatus = "queued" | "running" | "success" | "failed" | "canceled";
 type LogLevel = "info" | "ok" | "warn" | "error";
 type TaskKind = "k12" | "at-repair";
 type JsonOutFormat = "sub2api" | "cpa";
-type EmailOtpMode = "auto" | "manual" | "smsbower-mail";
+type EmailOtpMode = "auto" | "manual" | "smsbower-mail" | "emailnator";
+type GmailMailProvider = "smsbower" | "emailnator";
 
 interface AppConfig {
   port: number;
@@ -41,6 +42,7 @@ interface AppConfig {
   sub2apiRefillEmailCount: number;
   sub2apiRefillIntervalMs: number;
   sub2apiRefillDeepCheckEnabled: boolean;
+  gmailMailProvider: GmailMailProvider;
   smsBowerMailEnabled: boolean;
   smsBowerApiKey: string;
   smsBowerMailBaseUrl: string;
@@ -49,6 +51,8 @@ interface AppConfig {
   smsBowerMailMaxPrice: string;
   smsBowerGmailFissionEnabled: boolean;
   smsBowerGmailFissionCount: number;
+  emailnatorBaseUrl: string;
+  emailnatorEmailType: string;
   requireChatgptAccountId: boolean;
   tokenOut: string;
   jsonOutDir: string;
@@ -83,6 +87,12 @@ interface EmailRecord {
   smsBowerFissionChildrenCreatedAt?: string;
   smsBowerFissionParentEmailId?: string;
   smsBowerMailUsedCodes?: string[];
+  emailnatorSessionCookie?: string;
+  emailnatorXsrfToken?: string;
+  emailnatorBaseUrl?: string;
+  emailnatorUsedCodes?: string[];
+  emailnatorUsedMessageIds?: string[];
+  emailnatorBaselineMessageIds?: string[];
 }
 
 interface SmsBowerAccountSnapshot {
@@ -227,6 +237,8 @@ const DEFAULT_AT_LIVENESS_MODEL = "gpt-5.5";
 const MANUAL_OTP_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_SMSBOWER_MAIL_BASE_URL = "https://smsbower.page/api/mail";
 const DEFAULT_SMSBOWER_HANDLER_URL = "https://smsbower.page/stubs/handler_api.php";
+const DEFAULT_EMAILNATOR_BASE_URL = "https://www.emailnator.com";
+const K12_WORKSPACE_SWITCH_TOKEN_RETRIES = 6;
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
 const sentinelSdkFile = path.join(rootDir, "sdk.js");
@@ -301,6 +313,10 @@ function normalizePositiveId(value: unknown): number | undefined {
 
 function normalizeJsonOutFormat(value: unknown): JsonOutFormat {
   return String(value || "").trim().toLowerCase() === "cpa" ? "cpa" : "sub2api";
+}
+
+function normalizeGmailMailProvider(value: unknown): GmailMailProvider {
+  return String(value || "").trim().toLowerCase() === "emailnator" ? "emailnator" : "smsbower";
 }
 
 function randomItem<T>(items: T[]): T | undefined {
@@ -462,6 +478,7 @@ async function defaultConfig(): Promise<AppConfig> {
     sub2apiRefillEmailCount: 5,
     sub2apiRefillIntervalMs: 5 * 60 * 1000,
     sub2apiRefillDeepCheckEnabled: false,
+    gmailMailProvider: "smsbower",
     smsBowerMailEnabled: false,
     smsBowerApiKey: "",
     smsBowerMailBaseUrl: DEFAULT_SMSBOWER_MAIL_BASE_URL,
@@ -470,6 +487,8 @@ async function defaultConfig(): Promise<AppConfig> {
     smsBowerMailMaxPrice: "",
     smsBowerGmailFissionEnabled: false,
     smsBowerGmailFissionCount: 1,
+    emailnatorBaseUrl: DEFAULT_EMAILNATOR_BASE_URL,
+    emailnatorEmailType: "plusGmail",
     requireChatgptAccountId: true,
     tokenOut,
     jsonOutDir: defaultJsonOutDir,
@@ -516,6 +535,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     sub2apiRefillEmailCount: asNumber(raw.sub2apiRefillEmailCount, 5, 1, 500),
     sub2apiRefillIntervalMs: asNumber(raw.sub2apiRefillIntervalMs, 5 * 60 * 1000, 10000, 24 * 60 * 60 * 1000),
     sub2apiRefillDeepCheckEnabled: asBoolean(raw.sub2apiRefillDeepCheckEnabled, false),
+    gmailMailProvider: normalizeGmailMailProvider(raw.gmailMailProvider),
     smsBowerMailEnabled: asBoolean(raw.smsBowerMailEnabled, false),
     smsBowerApiKey: asString(raw.smsBowerApiKey),
     smsBowerMailBaseUrl: normalizeSmsBowerMailBaseUrl(raw.smsBowerMailBaseUrl),
@@ -524,6 +544,8 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     smsBowerMailMaxPrice: asString(raw.smsBowerMailMaxPrice),
     smsBowerGmailFissionEnabled: asBoolean(raw.smsBowerGmailFissionEnabled, false),
     smsBowerGmailFissionCount: asNumber(raw.smsBowerGmailFissionCount, 1, 1, 100),
+    emailnatorBaseUrl: normalizeEmailnatorBaseUrl(raw.emailnatorBaseUrl),
+    emailnatorEmailType: normalizeEmailnatorEmailType(raw.emailnatorEmailType),
     requireChatgptAccountId: asBoolean(raw.requireChatgptAccountId, true),
     tokenOut: asString(raw.tokenOut) || path.join(rootDir, "pool_tokens.txt"),
     jsonOutDir: asString(raw.jsonOutDir) || defaultJsonOutDir,
@@ -561,6 +583,7 @@ async function ensureCompatBundleConfig(): Promise<void> {
     sub2apiRefillEmailCount: appConfig.sub2apiRefillEmailCount,
     sub2apiRefillIntervalMs: appConfig.sub2apiRefillIntervalMs,
     sub2apiRefillDeepCheckEnabled: appConfig.sub2apiRefillDeepCheckEnabled,
+    gmailMailProvider: appConfig.gmailMailProvider,
     smsBowerMailEnabled: appConfig.smsBowerMailEnabled,
     smsBowerApiKey: appConfig.smsBowerApiKey,
     smsBowerMailBaseUrl: appConfig.smsBowerMailBaseUrl,
@@ -569,6 +592,8 @@ async function ensureCompatBundleConfig(): Promise<void> {
     smsBowerMailMaxPrice: appConfig.smsBowerMailMaxPrice,
     smsBowerGmailFissionEnabled: appConfig.smsBowerGmailFissionEnabled,
     smsBowerGmailFissionCount: appConfig.smsBowerGmailFissionCount,
+    emailnatorBaseUrl: appConfig.emailnatorBaseUrl,
+    emailnatorEmailType: appConfig.emailnatorEmailType,
     jsonOutDir: appConfig.jsonOutDir,
     jsonOutFormat: appConfig.jsonOutFormat,
   });
@@ -666,6 +691,25 @@ function normalizeSmsBowerMailBaseUrl(value: unknown): string {
   } catch {
     return DEFAULT_SMSBOWER_MAIL_BASE_URL;
   }
+}
+
+function normalizeEmailnatorBaseUrl(value: unknown): string {
+  const raw = asString(value, DEFAULT_EMAILNATOR_BASE_URL) || DEFAULT_EMAILNATOR_BASE_URL;
+  try {
+    const url = new URL(raw);
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/g, "");
+  } catch {
+    return DEFAULT_EMAILNATOR_BASE_URL;
+  }
+}
+
+function normalizeEmailnatorEmailType(value: unknown): string {
+  const text = asString(value, "plusGmail").trim();
+  const allowed = new Set(["domain", "plusGmail", "dotGmail", "googleMail"]);
+  return allowed.has(text) ? text : "plusGmail";
 }
 
 function smsBowerMailActionPath(action: string): string {
@@ -846,6 +890,80 @@ function extractVerificationCode(payload: unknown): string {
   return "";
 }
 
+function extractVerificationCodeFromText(value: unknown): string {
+  const text = String(value || "");
+  if (!isLikelyOpenAIOtpText(text)) return "";
+  const plainText = htmlToPlainText(text);
+  const patterns = [
+    /\b(?:OpenAI|ChatGPT|verification|security|login|sign[-\s]?in|code|验证码)\b[\s\S]{0,180}?\b([0-9][0-9\s-]{4,12}[0-9])\b/i,
+    /\b([0-9][0-9\s-]{4,12}[0-9])\b[\s\S]{0,120}?\b(?:OpenAI|ChatGPT|verification|security|login|sign[-\s]?in|code|验证码)\b/i,
+    /\b(?:enter|use)\s+(?:this\s+)?(?:temporary\s+)?(?:verification\s+)?code(?:\s+to\s+continue)?\s*:?\s*([0-9]{6})\b/i,
+    /\b(?:temporary\s+)?verification\s+code(?:\s+to\s+continue)?\s*:?\s*([0-9]{6})\b/i,
+    /\b(?:code|验证码|确认码)[^\d]{0,80}([0-9]{6})\b/i,
+  ];
+  for (const candidate of [plainText, text]) {
+    for (const pattern of patterns) {
+      const match = candidate.match(pattern);
+      if (!match) continue;
+      const code = match[1].replace(/\D/g, "");
+      if (code.length === 6) return code;
+    }
+  }
+  const plainCodes = Array.from(new Set((plainText.match(/\b[0-9]{6}\b/g) || [])));
+  if (plainCodes.length === 1) return plainCodes[0];
+  return "";
+}
+
+function decodeBasicHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, num: string) => String.fromCodePoint(parseInt(num, 10)));
+}
+
+function htmlToPlainText(value: string): string {
+  const withoutNoise = value
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(?:p|div|td|tr|table|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+  return decodeBasicHtmlEntities(withoutNoise).replace(/\s+/g, " ").trim();
+}
+
+function extractLooseVerificationCodeFromText(value: unknown): string {
+  const text = String(value || "");
+  for (const pattern of [
+    /\b(?:OpenAI|ChatGPT|verification|security|login|sign[-\s]?in|code|验证码)\b[\s\S]{0,180}?\b([0-9][0-9\s-]{4,12}[0-9])\b/i,
+    /\b([0-9][0-9\s-]{4,12}[0-9])\b[\s\S]{0,120}?\b(?:OpenAI|ChatGPT|verification|security|login|sign[-\s]?in|code|验证码)\b/i,
+    /\b([0-9]{6})\b/,
+  ]) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const code = match[1].replace(/\D/g, "");
+    if (code.length === 6) return code;
+  }
+  return "";
+}
+
+function isLikelyOpenAIOtpText(value: unknown): boolean {
+  return /openai|chatgpt|verification|verify|security|login|sign[-\s]?in|code|验证码|确认码|登录/i.test(String(value || ""));
+}
+
+function isLikelyEmailnatorOpenAIMessage(item: {from: string; subject: string}): boolean {
+  return isLikelyOpenAIOtpText(`${item.from}\n${item.subject}`) && /openai|chatgpt/i.test(`${item.from}\n${item.subject}`);
+}
+
+function maskOtpCode(code: string): string {
+  return code.length <= 2 ? "**" : `${code.slice(0, 2)}****`;
+}
+
 function parseSmsBowerTimestamp(value: unknown): number | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   if (typeof value === "number") {
@@ -984,6 +1102,258 @@ async function createSmsBowerMailRecords(count: number): Promise<EmailRecord[]> 
   return created;
 }
 
+function parseSetCookieHeader(headers: {get(name: string): string | null; getSetCookie?: () => string[]}): string {
+  const getSetCookie = (headers as unknown as {getSetCookie?: () => string[]}).getSetCookie;
+  const values = typeof getSetCookie === "function"
+    ? getSetCookie.call(headers)
+    : String(headers.get("set-cookie") || "").split(/,(?=[^;,]+=)/);
+  return values
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => item.split(";")[0])
+    .filter(Boolean)
+    .join("; ");
+}
+
+function readCookieValue(cookie: string, name: string): string {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = cookie.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function emailnatorHeaders(record: Pick<EmailRecord, "emailnatorSessionCookie" | "emailnatorXsrfToken" | "emailnatorBaseUrl">, refererPath = "/"): Record<string, string> {
+  const baseUrl = normalizeEmailnatorBaseUrl(record.emailnatorBaseUrl || appConfig.emailnatorBaseUrl);
+  return {
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    "X-Requested-With": "XMLHttpRequest",
+    "X-XSRF-TOKEN": String(record.emailnatorXsrfToken || ""),
+    Origin: baseUrl,
+    Referer: `${baseUrl}${refererPath}`,
+    "Sec-CH-UA": "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": "\"Windows\"",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-GPC": "1",
+    Priority: "u=1, i",
+    Cookie: String(record.emailnatorSessionCookie || ""),
+  };
+}
+
+async function createEmailnatorSession(): Promise<{baseUrl: string; cookie: string; xsrfToken: string}> {
+  const baseUrl = normalizeEmailnatorBaseUrl(appConfig.emailnatorBaseUrl);
+  const response = await undiciFetch(`${baseUrl}/`, {
+    ...buildDownloadFetchOptions(),
+    headers: {
+      Accept: "text/html,application/xhtml+xml",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    },
+  });
+  const body = await response.text().catch(() => "");
+  if (!response.ok) throw new Error(`Emailnator 首页请求失败: HTTP ${response.status}: ${body.slice(0, 200)}`);
+  const cookie = parseSetCookieHeader(response.headers);
+  const xsrfToken = readCookieValue(cookie, "XSRF-TOKEN");
+  if (!cookie || !xsrfToken) throw new Error("Emailnator 未返回 session/XSRF cookie，可能被 WAF 拦截");
+  return {baseUrl, cookie, xsrfToken};
+}
+
+async function requestEmailnatorJson<T>(
+  session: {baseUrl: string; cookie: string; xsrfToken: string},
+  pathname: string,
+  body: unknown,
+  refererPath = "/",
+): Promise<T> {
+  const response = await undiciFetch(`${session.baseUrl}${pathname}`, {
+    method: "POST",
+    ...buildDownloadFetchOptions(),
+    headers: emailnatorHeaders({
+      emailnatorBaseUrl: session.baseUrl,
+      emailnatorSessionCookie: session.cookie,
+      emailnatorXsrfToken: session.xsrfToken,
+    }, refererPath),
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Emailnator ${pathname} HTTP ${response.status}: ${text.slice(0, 300)}`);
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return text as T;
+  }
+}
+
+async function rentEmailnatorMail(): Promise<{email: string; cookie: string; xsrfToken: string; baseUrl: string; baselineMessageIds: string[]}> {
+  const session = await createEmailnatorSession();
+  const payload = await requestEmailnatorJson<Record<string, unknown>>(
+    session,
+    "/generate-email",
+    {email: [normalizeEmailnatorEmailType(appConfig.emailnatorEmailType)]},
+  );
+  const items = Array.isArray(payload?.email) ? payload.email.map((item) => String(item).trim()).filter(Boolean) : [];
+  const email = items.find((item) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item)) || "";
+  if (!email) throw new Error(`Emailnator 生成邮箱返回格式异常: ${JSON.stringify(payload).slice(0, 300)}`);
+  const normalizedEmail = email.toLowerCase();
+  let baselineMessageIds: string[] = [];
+  try {
+    const baselinePayload = await requestEmailnatorJson<unknown>(
+      session,
+      "/message-list",
+      {email: normalizedEmail},
+      `/mailbox/#${encodeURIComponent(normalizedEmail)}`,
+    );
+    baselineMessageIds = extractEmailnatorMessageItems(baselinePayload).map((item) => item.messageID);
+  } catch {
+    baselineMessageIds = [];
+  }
+  return {
+    email: normalizedEmail,
+    cookie: session.cookie,
+    xsrfToken: session.xsrfToken,
+    baseUrl: session.baseUrl,
+    baselineMessageIds,
+  };
+}
+
+async function createEmailnatorMailRecords(count: number): Promise<EmailRecord[]> {
+  const created: EmailRecord[] = [];
+  while (created.length < count) {
+    const rented = await rentEmailnatorMail();
+    const record: EmailRecord = {
+      id: `emailnator_${Date.now()}_${randomUUID().slice(0, 8)}`,
+      email: rented.email,
+      otpMode: "emailnator",
+      password: appConfig.defaultPassword,
+      mailboxUrl: "",
+      raw: `emailnator:${rented.email}`,
+      status: "free",
+      importedAt: nowIso(),
+      updatedAt: nowIso(),
+      emailnatorSessionCookie: rented.cookie,
+      emailnatorXsrfToken: rented.xsrfToken,
+      emailnatorBaseUrl: rented.baseUrl,
+      emailnatorUsedCodes: [],
+      emailnatorUsedMessageIds: [],
+      emailnatorBaselineMessageIds: rented.baselineMessageIds,
+    };
+    emails.push(record);
+    created.push(record);
+  }
+  await persistEmails();
+  return created;
+}
+
+async function refreshEmailnatorSession(email: EmailRecord): Promise<void> {
+  const session = await createEmailnatorSession();
+  email.emailnatorBaseUrl = session.baseUrl;
+  email.emailnatorSessionCookie = session.cookie;
+  email.emailnatorXsrfToken = session.xsrfToken;
+  email.updatedAt = nowIso();
+  await persistEmails();
+}
+
+async function requestEmailnatorForEmail<T>(email: EmailRecord, body: unknown): Promise<T> {
+  if (!email.emailnatorSessionCookie || !email.emailnatorXsrfToken) {
+    await refreshEmailnatorSession(email);
+  }
+  const session = {
+    baseUrl: normalizeEmailnatorBaseUrl(email.emailnatorBaseUrl || appConfig.emailnatorBaseUrl),
+    cookie: String(email.emailnatorSessionCookie || ""),
+    xsrfToken: String(email.emailnatorXsrfToken || ""),
+  };
+  try {
+    return await requestEmailnatorJson<T>(session, "/message-list", body, `/mailbox/#${encodeURIComponent(email.email)}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/419|401|403|csrf|xsrf|token|session/i.test(message)) throw error;
+    await refreshEmailnatorSession(email);
+    return requestEmailnatorJson<T>({
+      baseUrl: normalizeEmailnatorBaseUrl(email.emailnatorBaseUrl || appConfig.emailnatorBaseUrl),
+      cookie: String(email.emailnatorSessionCookie || ""),
+      xsrfToken: String(email.emailnatorXsrfToken || ""),
+    }, "/message-list", body, `/mailbox/#${encodeURIComponent(email.email)}`);
+  }
+}
+
+function extractEmailnatorMessageItems(payload: unknown): Array<{messageID: string; from: string; subject: string; time: string}> {
+  const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  const items = Array.isArray(record.messageData) ? record.messageData : Array.isArray(payload) ? payload : [];
+  return items
+    .filter((item) => item && typeof item === "object")
+    .map((item) => item as Record<string, unknown>)
+    .map((item) => ({
+      messageID: asString(item.messageID || item.messageId || item.id),
+      from: asString(item.from || item.sender),
+      subject: asString(item.subject || item.title),
+      time: asString(item.time || item.date),
+    }))
+    .filter((item) => item.messageID);
+}
+
+async function waitForEmailnatorCode(email: EmailRecord, task: K12Task, label: string): Promise<string> {
+  const waitStartedAt = Date.now();
+  task.waitingOtp = true;
+  task.waitingOtpLabel = label;
+  task.waitingOtpEmail = email.email;
+  task.waitingOtpSince = new Date(waitStartedAt).toISOString();
+  appendLog(task, "info", `等待 Emailnator ${label} 验证码: ${email.email}`);
+  await persistTasks();
+  let last = "";
+  try {
+    for (let attempt = 1; attempt <= 60; attempt += 1) {
+      assertNotCanceled(task);
+      const listPayload = await requestEmailnatorForEmail<unknown>(email, {email: email.email});
+      assertNotCanceled(task);
+      const items = extractEmailnatorMessageItems(listPayload)
+        .filter((item) => !(email.emailnatorUsedMessageIds || []).includes(item.messageID))
+        .filter((item) => !(email.emailnatorBaselineMessageIds || []).includes(item.messageID));
+      const likelyItems = items.filter(isLikelyEmailnatorOpenAIMessage);
+      for (const item of likelyItems) {
+        assertNotCanceled(task);
+        let detail: unknown;
+        try {
+          detail = await requestEmailnatorForEmail<unknown>(email, {email: email.email, messageID: item.messageID});
+        } catch (error) {
+          last = `message ${item.messageID} detail failed: ${error instanceof Error ? error.message : String(error)}`;
+          continue;
+        }
+        assertNotCanceled(task);
+        const detailText = typeof detail === "string" ? detail : JSON.stringify(detail);
+        const code = extractVerificationCodeFromText(`${item.from}\n${item.subject}\n${detailText}`);
+        if (!code) {
+          last = `message ${item.messageID} no code: ${item.subject}`;
+          continue;
+        }
+        if ((email.emailnatorUsedCodes || []).includes(code)) {
+          last = `Emailnator 返回已使用验证码 ${code}`;
+          continue;
+        }
+        email.emailnatorUsedCodes = Array.from(new Set([...(email.emailnatorUsedCodes || []), code])).slice(-20);
+        email.emailnatorUsedMessageIds = Array.from(new Set([...(email.emailnatorUsedMessageIds || []), item.messageID])).slice(-50);
+        email.updatedAt = nowIso();
+        await persistEmails();
+        appendLog(task, "ok", `Emailnator ${label} 验证码已获取: subject=${item.subject || "-"} message=${item.messageID} code=${maskOtpCode(code)}`);
+        return code;
+      }
+      if (attempt === 1 || attempt % 10 === 0) {
+        appendLog(task, "info", `Emailnator ${label} 验证码暂未收到，继续等待 (${attempt}/60)，候选邮件 ${likelyItems.length}/${items.length}`);
+      }
+      last ||= `candidate/openai=${likelyItems.length}/${items.length}`;
+      await sleepForTask(task, 3000);
+    }
+    throw new Error(`Emailnator 邮箱中未找到验证码: ${email.email}; last=${last}`);
+  } finally {
+    task.waitingOtp = false;
+    task.waitingOtpLabel = undefined;
+    task.waitingOtpEmail = undefined;
+    task.waitingOtpSince = undefined;
+  }
+}
+
 function createSmsBowerFissionChild(parent: EmailRecord): EmailRecord {
   const root = (parent.smsBowerMailRoot || rootMailboxIdentity(parent)).toLowerCase();
   const existing = new Set(emails.map((item) => item.email.toLowerCase()));
@@ -1029,21 +1399,24 @@ async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label:
   let last = "";
   try {
     for (let attempt = 1; attempt <= 60; attempt += 1) {
+      assertNotCanceled(task);
       let payload: unknown;
       try {
         payload = await requestSmsBowerMail("getCode", {mailId: id});
       } catch (error) {
+        assertNotCanceled(task);
         const message = error instanceof Error ? error.message : String(error);
         if (isSmsBowerCodePendingMessage(message)) {
           last = message;
           if (attempt === 1 || attempt % 10 === 0) {
             appendLog(task, "info", `SMSBower ${label} 验证码暂未收到，继续等待 (${attempt}/60)`);
           }
-          await new Promise((resolve) => setTimeout(resolve, 3000));
+          await sleepForTask(task, 3000);
           continue;
         }
         throw error;
       }
+      assertNotCanceled(task);
       const code = extractVerificationCode(payload);
       if (code) {
         const arrivalMs = extractSmsBowerCodeArrivalMs(payload);
@@ -1052,7 +1425,7 @@ async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label:
           if (attempt === 1 || attempt % 10 === 0) {
             appendLog(task, "info", `SMSBower ${label} 返回旧邮件，继续等待新验证码 (${attempt}/60)`);
           }
-          await new Promise((resolve) => setTimeout(resolve, 3000));
+          await sleepForTask(task, 3000);
           continue;
         }
         const related = emails.filter((item) => item.smsBowerMailId === id);
@@ -1065,7 +1438,7 @@ async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label:
         return code;
       }
       last = typeof payload === "string" ? payload : JSON.stringify(payload).slice(0, 180);
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      await sleepForTask(task, 3000);
     }
     throw new Error(`SMSBower 邮箱中未找到验证码: ${email.email}; last=${last}`);
   } finally {
@@ -1150,7 +1523,13 @@ function publicEmail(record: EmailRecord): Record<string, unknown> {
     otpMode: record.otpMode || "auto",
     passwordPresent: Boolean(record.password),
     passwordMasked: maskSecret(record.password, 3, 3),
-    mailboxUrlMasked: record.otpMode === "manual" ? "手动接码" : record.otpMode === "smsbower-mail" ? "SMSBower Gmail" : maskMailboxUrl(record.mailboxUrl),
+    mailboxUrlMasked: record.otpMode === "manual"
+      ? "手动接码"
+      : record.otpMode === "smsbower-mail"
+        ? "SMSBower Gmail"
+        : record.otpMode === "emailnator"
+          ? "Emailnator Gmail"
+          : maskMailboxUrl(record.mailboxUrl),
     status: record.status,
     importedAt: record.importedAt,
     updatedAt: record.updatedAt,
@@ -1165,6 +1544,7 @@ function publicEmail(record: EmailRecord): Record<string, unknown> {
     smsBowerMailCloseStatus: record.smsBowerMailCloseStatus,
     smsBowerFissionChildrenRemaining: record.smsBowerFissionChildrenRemaining,
     smsBowerFissionParentEmailId: record.smsBowerFissionParentEmailId,
+    emailnatorBaseUrl: record.emailnatorBaseUrl,
   };
 }
 
@@ -1287,11 +1667,19 @@ function normalizeImportedEmail(value: unknown): EmailRecord | null {
   const statusText = asString(record.status);
   const allowedStatuses = new Set<EmailStatus>(["free", "running", "success", "failed", "banned"]);
   const status = allowedStatuses.has(statusText as EmailStatus) ? statusText as EmailStatus : "free";
+  const rawOtpMode = asString(record.otpMode);
+  const otpMode = rawOtpMode === "manual"
+    ? "manual"
+    : rawOtpMode === "smsbower-mail"
+      ? "smsbower-mail"
+      : rawOtpMode === "emailnator"
+        ? "emailnator"
+        : "auto";
   return {
     id: asString(record.id) || stableId(email),
     email,
     parentEmail: asString(record.parentEmail) || undefined,
-    otpMode: record.otpMode === "manual" ? "manual" : record.otpMode === "smsbower-mail" ? "smsbower-mail" : "auto",
+    otpMode,
     password: String(record.password || ""),
     mailboxUrl: String(record.mailboxUrl || ""),
     clientId: asString(record.clientId) || undefined,
@@ -1309,6 +1697,16 @@ function normalizeImportedEmail(value: unknown): EmailRecord | null {
     smsBowerMailCost: record.smsBowerMailCost === undefined ? undefined : finiteNumber(record.smsBowerMailCost),
     smsBowerMailClosedAt: asString(record.smsBowerMailClosedAt) || undefined,
     smsBowerMailCloseStatus: record.smsBowerMailCloseStatus === undefined ? undefined : asNumber(record.smsBowerMailCloseStatus, 0),
+    smsBowerFissionChildrenRemaining: record.smsBowerFissionChildrenRemaining === undefined ? undefined : asNumber(record.smsBowerFissionChildrenRemaining, 0),
+    smsBowerFissionChildrenCreatedAt: asString(record.smsBowerFissionChildrenCreatedAt) || undefined,
+    smsBowerFissionParentEmailId: asString(record.smsBowerFissionParentEmailId) || undefined,
+    smsBowerMailUsedCodes: Array.isArray(record.smsBowerMailUsedCodes) ? record.smsBowerMailUsedCodes.map((item) => String(item)).filter(Boolean).slice(-20) : undefined,
+    emailnatorSessionCookie: asString(record.emailnatorSessionCookie) || undefined,
+    emailnatorXsrfToken: asString(record.emailnatorXsrfToken) || undefined,
+    emailnatorBaseUrl: asString(record.emailnatorBaseUrl) || undefined,
+    emailnatorUsedCodes: Array.isArray(record.emailnatorUsedCodes) ? record.emailnatorUsedCodes.map((item) => String(item)).filter(Boolean).slice(-20) : undefined,
+    emailnatorUsedMessageIds: Array.isArray(record.emailnatorUsedMessageIds) ? record.emailnatorUsedMessageIds.map((item) => String(item)).filter(Boolean).slice(-50) : undefined,
+    emailnatorBaselineMessageIds: Array.isArray(record.emailnatorBaselineMessageIds) ? record.emailnatorBaselineMessageIds.map((item) => String(item)).filter(Boolean).slice(-100) : undefined,
   };
 }
 
@@ -1706,6 +2104,15 @@ function normalizeFlowError(error: unknown): string {
 
 async function sleep(ms: number): Promise<void> {
   if (ms > 0) await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sleepForTask(task: K12Task, ms: number): Promise<void> {
+  const deadline = Date.now() + Math.max(0, ms);
+  while (Date.now() < deadline) {
+    assertNotCanceled(task);
+    await sleep(Math.min(250, deadline - Date.now()));
+  }
+  assertNotCanceled(task);
 }
 
 async function sendK12Invite(task: K12Task, client: any, accessToken: string, workspaceId: string, route: K12Route): Promise<K12WorkspaceResult> {
@@ -2534,10 +2941,14 @@ async function switchToK12WorkspaceAccessToken(client: any, task: K12Task, acces
   }
 
   let latestToken = "";
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    latestToken = await readChatGptSessionAccessToken(client, task, `workspace/select ${workspaceId.slice(0, 8)}... 后 第 ${attempt} 次`);
+  for (let attempt = 1; attempt <= K12_WORKSPACE_SWITCH_TOKEN_RETRIES; attempt += 1) {
+    latestToken = await readChatGptSessionAccessToken(
+      client,
+      task,
+      `workspace/select ${workspaceId.slice(0, 8)}... 后 第 ${attempt}/${K12_WORKSPACE_SWITCH_TOKEN_RETRIES} 次`,
+    );
     if (isK12AccessToken(latestToken, task)) return latestToken;
-    if (attempt < 3) await sleep(1000);
+    if (attempt < K12_WORKSPACE_SWITCH_TOKEN_RETRIES) await sleep(1000);
   }
   appendLog(task, "warn", `workspace/select 后 session AT 仍不是 K12: ${describeAccessTokenContext(latestToken || accessToken)}`);
   return latestToken || accessToken;
@@ -3330,8 +3741,8 @@ function pendingSub2ApiRefillTaskCount(groupName: string): number {
 function availableRefillEmails(): EmailRecord[] {
   if (appConfig.smsBowerMailEnabled) {
     return Array.from({length: Math.max(1, appConfig.sub2apiRefillEmailCount)}, (_, index) => ({
-      id: `smsbower_available_${index}`,
-      email: `smsbower-dynamic-${index}@gmail.com`,
+      id: `${appConfig.gmailMailProvider}_available_${index}`,
+      email: `${appConfig.gmailMailProvider}-dynamic-${index}@gmail.com`,
       password: "",
       mailboxUrl: "",
       raw: "",
@@ -4144,6 +4555,9 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
   } else if (email.otpMode === "smsbower-mail") {
     appendLog(task, "info", `当前邮箱为 SMSBower Gmail 动态接码模式: ${email.smsBowerMailId || "-"}`);
     fetchOtp = (label: string) => waitForSmsBowerMailCode(email, task, label);
+  } else if (email.otpMode === "emailnator") {
+    appendLog(task, "info", `当前邮箱为 Emailnator Gmail 动态接码模式: ${email.email}`);
+    fetchOtp = (label: string) => waitForEmailnatorCode(email, task, label);
   } else {
     const mailboxProvider = new MailboxUrlCodeProvider(email.mailboxUrl);
     try {
@@ -4982,14 +5396,16 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
   const requested = new Set(requestedEmailIds);
   const existingIds = new Set(emails.map((item) => item.id));
   const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
-  const dynamicSmsBowerMode = !requestedEmailIds.length && appConfig.smsBowerMailEnabled;
+  const dynamicGmailMode = !requestedEmailIds.length && appConfig.smsBowerMailEnabled;
   let selectedEmails = requestedEmailIds.length
     ? emails.filter((item) => requested.has(item.id))
     : emails.filter((item) => item.status === "free");
-  const defaultLimit = dynamicSmsBowerMode ? 1 : selectedEmails.length || 1;
+  const defaultLimit = dynamicGmailMode ? 1 : selectedEmails.length || 1;
   const limit = asNumber(body.count, defaultLimit, 1, 500);
-  if (dynamicSmsBowerMode) {
-    selectedEmails = await createSmsBowerMailRecords(limit);
+  if (dynamicGmailMode) {
+    selectedEmails = appConfig.gmailMailProvider === "emailnator"
+      ? await createEmailnatorMailRecords(limit)
+      : await createSmsBowerMailRecords(limit);
   }
   const workspaceCandidates = uniqueStringList(parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : appConfig.workspaceIds);
   const route = body.route === "accept" ? "accept" : appConfig.route;
@@ -5460,6 +5876,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       skippedRunning: result.skippedRunning,
       missing: result.missing,
       smsBowerMailEnabled: appConfig.smsBowerMailEnabled,
+      gmailMailProvider: appConfig.gmailMailProvider,
     });
     return;
   }
@@ -5504,12 +5921,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     if (method === "POST" && taskMatch[2] === "cancel") {
       task.cancelRequested = true;
       cancelManualEmailOtp(task.id, "任务已取消，手动验证码等待结束");
+      task.waitingOtp = false;
+      task.waitingOtpLabel = undefined;
+      task.waitingOtpEmail = undefined;
+      task.waitingOtpSince = undefined;
       if (task.status === "queued") {
         task.status = "canceled";
         task.finishedAt = nowIso();
         appendLog(task, "warn", "任务已取消");
       } else {
-        appendLog(task, "warn", "已请求取消，当前步骤结束后生效");
+        appendLog(task, "warn", "已请求取消，正在快速停止当前任务");
       }
       await persistTasks();
       sendJson(res, 200, {task: publicTask(task)});

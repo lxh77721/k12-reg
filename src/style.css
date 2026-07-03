@@ -738,6 +738,28 @@ input[type="checkbox"] {
   min-width: 1040px;
 }
 
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pagination-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pagination-actions strong {
+  color: var(--text);
+  white-space: nowrap;
+}
+
 .task-row {
   cursor: pointer;
 }
@@ -846,6 +868,12 @@ input[type="checkbox"] {
   color: #fde68a;
   border-color: rgba(251, 191, 36, 0.36);
   background: rgba(251, 191, 36, 0.12);
+}
+
+.otp-mode-badge.emailnator {
+  color: #a5f3fc;
+  border-color: rgba(34, 211, 238, 0.4);
+  background: rgba(34, 211, 238, 0.12);
 }
 
 .manual-import-hint {
