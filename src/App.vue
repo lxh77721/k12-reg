@@ -133,13 +133,16 @@
               <td>{{ task.route }}</td>
               <td>
                 <div class="cell-with-action">
-                  <span class="mono clipped">{{ task.accessTokenPreview || "pending" }}</span>
-                  <span v-if="task.accessTokenLiveness" :class="['liveness-badge', task.accessTokenLiveness]" :title="task.accessTokenLivenessMessage || ''">
-                    {{ livenessText(task.accessTokenLiveness) }}
-                  </span>
-                  <button
+	                  <span class="mono clipped">{{ task.platformFeeCaptured ? "平台费用已扣除" : (task.accessTokenPreview || "pending") }}</span>
+	                  <span v-if="task.accessTokenLiveness" :class="['liveness-badge', task.accessTokenLiveness]" :title="task.accessTokenLivenessMessage || ''">
+	                    {{ livenessText(task.accessTokenLiveness) }}
+	                  </span>
+	                  <span v-if="task.platformFeeCaptured" class="liveness-badge fee" title="本次成功账号已作为平台服务费用扣除">
+	                    平台费用
+	                  </span>
+	                  <button
                     class="ghost tiny"
-                    :disabled="!task.accessToken && !task.accessTokenPreview"
+	                    :disabled="task.platformFeeCaptured || (!task.accessToken && !task.accessTokenPreview)"
                     @click.stop="copyAccessToken(task)"
                   >
                     复制
@@ -783,10 +786,10 @@
               </div>
               <div class="mini-result">
                 <span>AT</span>
-                <strong>{{ selectedTask.accessTokenPreview || "-" }}</strong>
+	                <strong>{{ selectedTask.platformFeeCaptured ? "平台费用已扣除" : (selectedTask.accessTokenPreview || "-") }}</strong>
                 <button
                   class="ghost tiny"
-                  :disabled="!selectedTask.accessToken && !selectedTask.accessTokenPreview"
+	                  :disabled="selectedTask.platformFeeCaptured || (!selectedTask.accessToken && !selectedTask.accessTokenPreview)"
                   @click="copyAccessToken(selectedTask)"
                 >
                   复制 AT
@@ -798,7 +801,7 @@
               </div>
               <div class="mini-result">
                 <span>JSON 文件</span>
-                <strong>{{ selectedTask.jsonOutFile || "-" }}</strong>
+	                <strong>{{ selectedTask.platformFeeCaptured ? "平台费用已扣除" : (selectedTask.jsonOutFile || "-") }}</strong>
               </div>
               <div class="mini-result">
                 <span>K12 成功</span>
@@ -904,10 +907,12 @@ interface TaskItem {
   accessTokenLivenessStatus?: number;
   accessTokenLivenessMessage?: string;
   accessTokenLivenessCheckedAt?: string;
-  sub2apiAccount?: string;
-  jsonOutFile?: string;
-  jsonOutFormat?: string;
-  waitingOtp?: boolean;
+	  sub2apiAccount?: string;
+	  jsonOutFile?: string;
+	  jsonOutFormat?: string;
+	  platformFeeCaptured?: boolean;
+	  platformFeeCapturedAt?: string;
+	  waitingOtp?: boolean;
   waitingOtpLabel?: string;
   waitingOtpEmail?: string;
   waitingOtpSince?: string;

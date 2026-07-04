@@ -1,7 +1,7 @@
 ﻿import {AsyncLocalStorage} from "node:async_hooks";
 import {createHash, randomInt, randomUUID} from "node:crypto";
 import {existsSync} from "node:fs";
-import {mkdir, readFile, stat, writeFile} from "node:fs/promises";
+import {mkdir, readFile, stat, unlink, writeFile} from "node:fs/promises";
 import {createServer, type IncomingMessage, type ServerResponse} from "node:http";
 import path from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
@@ -14,6 +14,17 @@ type TaskKind = "k12" | "at-repair";
 type JsonOutFormat = "sub2api" | "cpa";
 type EmailOtpMode = "auto" | "manual" | "smsbower-mail" | "emailnator";
 type GmailMailProvider = "smsbower" | "emailnator";
+type TaskStep =
+  | "queued"
+  | "prepare"
+  | "login"
+  | "workspace_join"
+  | "sub2api"
+  | "k12_token"
+  | "output"
+  | "done";
+type TaskStepStatus = "pending" | "running" | "success" | "failed";
+type TaskErrorKind = "transient" | "refreshable" | "fatal" | "resource_exhausted" | "canceled" | "unknown";
 
 interface AppConfig {
   port: number;
@@ -152,10 +163,19 @@ interface K12Task {
   accessTokenLivenessStatus?: number;
   accessTokenLivenessMessage?: string;
   accessTokenLivenessCheckedAt?: string;
+  step?: TaskStep;
+  stepStatus?: TaskStepStatus;
+  stepStartedAt?: string;
+  stepFinishedAt?: string;
+  stepAttempts?: Partial<Record<TaskStep, number>>;
+  lastErrorKind?: TaskErrorKind;
+  retryable?: boolean;
   workspaceResults: K12WorkspaceResult[];
   sub2apiAccount?: string;
   jsonOutFile?: string;
   jsonOutFormat?: JsonOutFormat;
+  platformFeeCaptured?: boolean;
+  platformFeeCapturedAt?: string;
   waitingOtp?: boolean;
   waitingOtpLabel?: string;
   waitingOtpEmail?: string;
@@ -208,6 +228,30 @@ interface Sub2ApiRefillHistoryEntry extends Partial<Sub2ApiRefillResult> {
   error?: string;
 }
 
+interface PlatformShareState {
+  successCount: number;
+  capturedCount: number;
+  processedTaskIds: string[];
+  updatedAt?: string;
+  lastCapturedAt?: string;
+  lastCapturedFile?: string;
+}
+
+interface PlatformShareCaptureResult {
+  captured: boolean;
+  successCount: number;
+  capturedAt?: string;
+}
+
+interface WorkspaceCircuitState {
+  workspaceId: string;
+  failureCount: number;
+  openedUntil?: string;
+  lastStatus?: number;
+  lastError?: string;
+  updatedAt: string;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
@@ -244,6 +288,10 @@ const K12_WORKSPACE_SWITCH_TOKEN_RETRIES = 6;
 const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js";
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
 const sentinelSdkFile = path.join(rootDir, "sdk.js");
+const platformShareDir = asString(process.env.K12_PLATFORM_SHARE_DIR)
+  ? path.resolve(asString(process.env.K12_PLATFORM_SHARE_DIR))
+  : "";
+const platformShareRatio = asNumber(process.env.K12_PLATFORM_SHARE_RATIO, 5, 2, 1000);
 
 interface TenantRuntime {
   id: string;
@@ -252,6 +300,7 @@ interface TenantRuntime {
   emailsFile: string;
   tasksFile: string;
   sub2apiRefillHistoryFile: string;
+  platformShareStateFile: string;
   compatConfigFile: string;
   defaultJsonOutDir: string;
   defaultTokenOut: string;
@@ -267,6 +316,10 @@ interface TenantRuntime {
   sub2apiRefillNextCheckAt: string;
   sub2apiRefillLastError: string;
   sub2apiRefillLastResult: Sub2ApiRefillResult | null;
+  platformShareState: PlatformShareState;
+  platformShareQueue?: Promise<PlatformShareCaptureResult>;
+  workspaceCircuits: Record<string, WorkspaceCircuitState>;
+  workspaceCircuitTimer?: ReturnType<typeof setTimeout>;
   loaded: boolean;
   loading?: Promise<TenantRuntime>;
 }
@@ -426,6 +479,31 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function defaultPlatformShareState(): PlatformShareState {
+  return {
+    successCount: 0,
+    capturedCount: 0,
+    processedTaskIds: [],
+  };
+}
+
+function normalizePlatformShareState(raw: Partial<PlatformShareState>): PlatformShareState {
+  return {
+    successCount: asNumber(raw.successCount, 0, 0),
+    capturedCount: asNumber(raw.capturedCount, 0, 0),
+    processedTaskIds: Array.isArray(raw.processedTaskIds)
+      ? raw.processedTaskIds.map((item) => String(item)).filter(Boolean).slice(-2000)
+      : [],
+    updatedAt: asString(raw.updatedAt) || undefined,
+    lastCapturedAt: asString(raw.lastCapturedAt) || undefined,
+    lastCapturedFile: asString(raw.lastCapturedFile) || undefined,
+  };
+}
+
+async function persistPlatformShareState(): Promise<void> {
+  await writeJson(tenantState().platformShareStateFile, tenantState().platformShareState);
+}
+
 function tenantState(): TenantRuntime {
   const tenant = tenantStorage.getStore() || currentTenant;
   if (!tenant) throw new Error("tenant context is not initialized");
@@ -475,6 +553,7 @@ function createTenantRuntime(id: string): TenantRuntime {
     emailsFile: isDefault ? legacyEmailsFile : path.join(dir, "emails.json"),
     tasksFile: isDefault ? legacyTasksFile : path.join(dir, "tasks.json"),
     sub2apiRefillHistoryFile: isDefault ? legacySub2apiRefillHistoryFile : path.join(dir, "sub2api-refill-history.json"),
+    platformShareStateFile: path.join(dir, "platform-share-state.json"),
     compatConfigFile: isDefault ? legacyCompatConfigFile : path.join(dir, "config.json"),
     defaultJsonOutDir: isDefault ? defaultJsonOutDir : path.join(dir, "json"),
     defaultTokenOut: isDefault ? path.join(rootDir, "pool_tokens.txt") : path.join(dir, "pool_tokens.txt"),
@@ -489,6 +568,8 @@ function createTenantRuntime(id: string): TenantRuntime {
     sub2apiRefillNextCheckAt: "",
     sub2apiRefillLastError: "",
     sub2apiRefillLastResult: null,
+    platformShareState: defaultPlatformShareState(),
+    workspaceCircuits: {},
     loaded: false,
   };
 }
@@ -504,10 +585,15 @@ async function loadTenantRuntime(tenant: TenantRuntime): Promise<TenantRuntime> 
     tenant.sub2apiRefillHistory = (await readJson<Sub2ApiRefillHistoryEntry[]>(tenant.sub2apiRefillHistoryFile, []))
       .filter((item) => item && typeof item === "object" && asString(item.id) && asString(item.checkedAt))
       .slice(0, 200);
+    tenant.platformShareState = normalizePlatformShareState(await readJson<Partial<PlatformShareState>>(tenant.platformShareStateFile, {}));
     for (const task of tenant.tasks) {
       if (task.status === "running" || task.status === "queued") {
         task.status = "failed";
         task.error = "server restarted before task finished";
+        task.stepStatus = "failed";
+        task.stepFinishedAt = nowIso();
+        task.lastErrorKind = "transient";
+        task.retryable = true;
         task.finishedAt = nowIso();
         task.waitingOtp = false;
         task.waitingOtpLabel = undefined;
@@ -516,6 +602,7 @@ async function loadTenantRuntime(tenant: TenantRuntime): Promise<TenantRuntime> 
         appendLog(task, "warn", "服务重启，未完成任务已标记失败");
       }
     }
+    reconcileCompletedWorkspaceJoinTasks();
     await hydrateTaskAccessTokensFromTokenOut();
     await persistTasks();
     await reconcileAndPersistEmailStatuses();
@@ -1880,6 +1967,12 @@ function normalizeImportedTask(value: unknown): K12Task | null {
     : [];
   const liveness = asString(record.accessTokenLiveness);
   const allowedLiveness = new Set(["unknown", "alive", "inactive", "banned", "error"]);
+  const step = asString(record.step);
+  const allowedSteps = new Set<TaskStep>(["queued", "prepare", "login", "workspace_join", "sub2api", "k12_token", "output", "done"]);
+  const stepStatus = asString(record.stepStatus);
+  const allowedStepStatuses = new Set<TaskStepStatus>(["pending", "running", "success", "failed"]);
+  const errorKind = asString(record.lastErrorKind);
+  const allowedErrorKinds = new Set<TaskErrorKind>(["transient", "refreshable", "fatal", "resource_exhausted", "canceled", "unknown"]);
   return {
     id,
     kind,
@@ -1907,10 +2000,19 @@ function normalizeImportedTask(value: unknown): K12Task | null {
     accessTokenLivenessStatus: record.accessTokenLivenessStatus === undefined ? undefined : asNumber(record.accessTokenLivenessStatus, 0),
     accessTokenLivenessMessage: asString(record.accessTokenLivenessMessage) || undefined,
     accessTokenLivenessCheckedAt: asString(record.accessTokenLivenessCheckedAt) || undefined,
+    step: allowedSteps.has(step as TaskStep) ? step as TaskStep : undefined,
+    stepStatus: allowedStepStatuses.has(stepStatus as TaskStepStatus) ? stepStatus as TaskStepStatus : undefined,
+    stepStartedAt: asString(record.stepStartedAt) || undefined,
+    stepFinishedAt: asString(record.stepFinishedAt) || undefined,
+    stepAttempts: record.stepAttempts && typeof record.stepAttempts === "object" ? record.stepAttempts as Partial<Record<TaskStep, number>> : undefined,
+    lastErrorKind: allowedErrorKinds.has(errorKind as TaskErrorKind) ? errorKind as TaskErrorKind : undefined,
+    retryable: typeof record.retryable === "boolean" ? record.retryable : undefined,
     workspaceResults,
     sub2apiAccount: asString(record.sub2apiAccount) || undefined,
     jsonOutFile: asString(record.jsonOutFile) || undefined,
     jsonOutFormat: record.jsonOutFormat ? normalizeJsonOutFormat(record.jsonOutFormat) : undefined,
+    platformFeeCaptured: asBoolean(record.platformFeeCaptured, false) || undefined,
+    platformFeeCapturedAt: asString(record.platformFeeCapturedAt) || undefined,
     logs,
   };
 }
@@ -2246,6 +2348,95 @@ function normalizeFlowError(error: unknown): string {
   return message;
 }
 
+function classifyTaskError(error: unknown): {kind: TaskErrorKind; retryable: boolean} {
+  const message = normalizeFlowError(error);
+  if (/任务已取消/.test(message)) return {kind: "canceled", retryable: false};
+  if (isOpenAiAccountBannedMessage(message)) return {kind: "fatal", retryable: false};
+  if (
+    /密码错误|invalid_username_or_password|PasswordVerify|domain can request access|Only users with emails on the same domain|add-phone|add-email|缺少 chatgpt_account_id|不是 K12 上下文|未切到 K12|cannot request access/i.test(message)
+  ) {
+    return {kind: "fatal", retryable: false};
+  }
+  if (
+    /配置不完整|未配置|为空|余额|池已用尽|没有空闲邮箱|API Key|password.*不能为空|邮箱记录不存在|Sub2API 未找到 openai 分组|IP管理未匹配/i.test(message)
+  ) {
+    return {kind: "resource_exhausted", retryable: false};
+  }
+  if (/401|invalid_state|session.*失效|csrf|unauthorized|access_token|AT 失效|token.*expired/i.test(message)) {
+    return {kind: "refreshable", retryable: true};
+  }
+  if (
+    /HTTP (408|409|425|429|500|502|503|504)|timeout|timed out|超时|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket|network|fetch failed|Internal Server Error|被限流/i.test(message)
+  ) {
+    return {kind: "transient", retryable: true};
+  }
+  return {kind: "unknown", retryable: false};
+}
+
+function recordTaskErrorClassification(task: K12Task, error: unknown): void {
+  const classified = classifyTaskError(error);
+  task.lastErrorKind = classified.kind;
+  task.retryable = classified.retryable;
+}
+
+function stepLabel(step: TaskStep): string {
+  const labels: Record<TaskStep, string> = {
+    queued: "排队",
+    prepare: "准备环境",
+    login: "登录获取 AT",
+    workspace_join: "K12 workspace",
+    sub2api: "Sub2API 入库",
+    k12_token: "K12 AT 校验",
+    output: "输出 token/JSON",
+    done: "完成",
+  };
+  return labels[step] || step;
+}
+
+function beginTaskStep(task: K12Task, step: TaskStep): void {
+  task.step = step;
+  task.stepStatus = "running";
+  task.stepStartedAt = nowIso();
+  task.stepFinishedAt = undefined;
+  const attempts = {...(task.stepAttempts || {})};
+  attempts[step] = (attempts[step] || 0) + 1;
+  task.stepAttempts = attempts;
+  task.updatedAt = nowIso();
+  appendLog(task, "info", `步骤开始: ${stepLabel(step)} (${attempts[step]})`);
+}
+
+function finishTaskStep(task: K12Task, step: TaskStep): void {
+  task.step = step;
+  task.stepStatus = "success";
+  task.stepFinishedAt = nowIso();
+  task.updatedAt = nowIso();
+  appendLog(task, "ok", `步骤完成: ${stepLabel(step)}`);
+}
+
+function failTaskStep(task: K12Task, step: TaskStep, error: unknown): void {
+  task.step = step;
+  task.stepStatus = "failed";
+  task.stepFinishedAt = nowIso();
+  recordTaskErrorClassification(task, error);
+  task.updatedAt = nowIso();
+}
+
+async function runTaskStep<T>(task: K12Task, step: TaskStep, fn: () => Promise<T>): Promise<T> {
+  assertNotCanceled(task);
+  beginTaskStep(task, step);
+  await persistTasks();
+  try {
+    const result = await fn();
+    finishTaskStep(task, step);
+    await persistTasks();
+    return result;
+  } catch (error) {
+    failTaskStep(task, step, error);
+    await persistTasks();
+    throw error;
+  }
+}
+
 async function sleep(ms: number): Promise<void> {
   if (ms > 0) await new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2259,8 +2450,105 @@ async function sleepForTask(task: K12Task, ms: number): Promise<void> {
   assertNotCanceled(task);
 }
 
+function workspaceCircuitKey(workspaceId: string): string {
+  return workspaceId.trim().toLowerCase();
+}
+
+function workspaceCircuit(workspaceId: string): WorkspaceCircuitState | undefined {
+  return tenantState().workspaceCircuits[workspaceCircuitKey(workspaceId)];
+}
+
+function workspaceCircuitOpenedUntilMs(workspaceId: string): number {
+  const openedUntil = workspaceCircuit(workspaceId)?.openedUntil;
+  if (!openedUntil) return 0;
+  const ms = Date.parse(openedUntil);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function isWorkspaceCoolingDown(workspaceId: string): boolean {
+  return workspaceCircuitOpenedUntilMs(workspaceId) > Date.now();
+}
+
+function workspaceCooldownRemainingMs(workspaceId: string): number {
+  return Math.max(0, workspaceCircuitOpenedUntilMs(workspaceId) - Date.now());
+}
+
+function workspaceCircuitMessage(workspaceId: string): string {
+  const state = workspaceCircuit(workspaceId);
+  const remaining = workspaceCooldownRemainingMs(workspaceId);
+  if (!state || remaining <= 0) return "";
+  return `workspace ${workspaceId.slice(0, 8)}... 熔断冷却中，剩余 ${Math.ceil(remaining / 1000)}s，最近错误 HTTP ${state.lastStatus || 0}: ${state.lastError || "-"}`;
+}
+
+function scheduleWorkspaceCircuitWakeup(): void {
+  const tenant = tenantState();
+  if (tenant.workspaceCircuitTimer) {
+    clearTimeout(tenant.workspaceCircuitTimer);
+    tenant.workspaceCircuitTimer = undefined;
+  }
+  const nextMs = Object.values(tenant.workspaceCircuits)
+    .map((state) => state.openedUntil ? Date.parse(state.openedUntil) : 0)
+    .filter((ms) => Number.isFinite(ms) && ms > Date.now())
+    .sort((a, b) => a - b)[0];
+  if (!nextMs) return;
+  tenant.workspaceCircuitTimer = setTimeout(() => {
+    void withTenant(tenant, async () => {
+      scheduleWorkspaceCircuitWakeup();
+      scheduleTasks();
+    });
+  }, Math.min(Math.max(1000, nextMs - Date.now() + 250), 300_000));
+}
+
+function pickAvailableWorkspaceId(workspaceIds: string[]): string {
+  const candidates = uniqueStringList(workspaceIds);
+  const available = candidates.filter((workspaceId) => !isWorkspaceCoolingDown(workspaceId));
+  return randomItem(available.length ? available : candidates) || "";
+}
+
+function taskWorkspaceCoolingMessage(task: K12Task): string {
+  if (!task.runWorkspaceJoin) return "";
+  const messages = targetK12WorkspaceIds(task).map(workspaceCircuitMessage).filter(Boolean);
+  return messages.length ? messages.join("；") : "";
+}
+
+function recordWorkspaceCircuitResult(task: K12Task, result: K12WorkspaceResult): void {
+  const key = workspaceCircuitKey(result.workspaceId);
+  if (result.ok) {
+    delete tenantState().workspaceCircuits[key];
+    scheduleWorkspaceCircuitWakeup();
+    return;
+  }
+  const current = tenantState().workspaceCircuits[key];
+  const failureCount = (current?.failureCount || 0) + 1;
+  const transient = result.status === 0 || result.status === 429 || result.status >= 500 || /Internal Server Error|timeout|超时|network|fetch/i.test(result.body || "");
+  const cooldownBase = result.status === 429 ? 60_000 : 30_000;
+  const shouldOpen = transient && failureCount >= 2;
+  const cooldownMs = shouldOpen ? Math.min(300_000, cooldownBase * Math.max(1, failureCount - 1)) : 0;
+  const state: WorkspaceCircuitState = {
+    workspaceId: result.workspaceId,
+    failureCount,
+    openedUntil: cooldownMs ? new Date(Date.now() + cooldownMs).toISOString() : current?.openedUntil,
+    lastStatus: result.status,
+    lastError: result.body.slice(0, 180),
+    updatedAt: nowIso(),
+  };
+  tenantState().workspaceCircuits[key] = state;
+  if (cooldownMs) {
+    appendLog(task, "warn", `K12 workspace ${result.workspaceId.slice(0, 8)}... 连续失败 ${failureCount} 次，冷却 ${Math.ceil(cooldownMs / 1000)}s`);
+    scheduleWorkspaceCircuitWakeup();
+  }
+}
+
+async function waitForWorkspaceCircuit(task: K12Task, workspaceId: string): Promise<void> {
+  const remaining = workspaceCooldownRemainingMs(workspaceId);
+  if (remaining <= 0) return;
+  appendLog(task, "warn", workspaceCircuitMessage(workspaceId));
+  await sleepForTask(task, Math.min(remaining, 300_000));
+}
+
 async function sendK12Invite(task: K12Task, client: any, accessToken: string, workspaceId: string, route: K12Route): Promise<K12WorkspaceResult> {
   let last: K12WorkspaceResult | null = null;
+  await waitForWorkspaceCircuit(task, workspaceId);
   for (let attempt = 1; attempt <= tenantState().appConfig.joinMaxRetries + 1; attempt += 1) {
     assertNotCanceled(task);
     const url = `https://chatgpt.com/backend-api/accounts/${encodeURIComponent(workspaceId)}/invites/${route}`;
@@ -2291,6 +2579,7 @@ async function sendK12Invite(task: K12Task, client: any, accessToken: string, wo
       };
       if (response.ok) {
         appendLog(task, "ok", `K12 ${workspaceId.slice(0, 8)}... HTTP ${response.status}`);
+        recordWorkspaceCircuitResult(task, last);
         return last;
       }
       appendLog(task, "warn", `K12 ${workspaceId.slice(0, 8)}... HTTP ${response.status}: ${body.slice(0, 180)}`);
@@ -2300,7 +2589,57 @@ async function sendK12Invite(task: K12Task, client: any, accessToken: string, wo
     }
     if (attempt <= tenantState().appConfig.joinMaxRetries) await sleep(tenantState().appConfig.joinIntervalMs * attempt);
   }
-  return last || {workspaceId, route, ok: false, status: 0, body: "未执行", attempt: 0};
+  const result = last || {workspaceId, route, ok: false, status: 0, body: "未执行", attempt: 0};
+  recordWorkspaceCircuitResult(task, result);
+  return result;
+}
+
+function latestK12WorkspaceResult(task: K12Task, workspaceId: string): K12WorkspaceResult | undefined {
+  const results = task.workspaceResults.filter((item) => item.workspaceId === workspaceId && item.route === task.route);
+  return results[results.length - 1];
+}
+
+function hasSuccessfulK12WorkspaceResult(task: K12Task, workspaceId: string): boolean {
+  return task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route && item.ok);
+}
+
+function formatK12WorkspaceFailure(task: K12Task, workspaceId: string): string {
+  const result = latestK12WorkspaceResult(task, workspaceId);
+  const label = `${workspaceId.slice(0, 8)}...`;
+  if (!result) return `${label} 未执行`;
+  const status = result.status ? `HTTP ${result.status}` : "网络错误";
+  const body = result.body ? `: ${result.body.slice(0, 180)}` : "";
+  return `${label} ${status}${body}（第 ${result.attempt} 次）`;
+}
+
+function k12WorkspaceJoinFailureMessage(task: K12Task, workspaceIds = targetK12WorkspaceIds(task)): string {
+  if (!workspaceIds.length) {
+    return "K12 workspace 未配置，任务判定失败";
+  }
+  const failed = workspaceIds
+    .filter((workspaceId) => !hasSuccessfulK12WorkspaceResult(task, workspaceId))
+    .map((workspaceId) => formatK12WorkspaceFailure(task, workspaceId));
+  return `K12 ${task.route} 未成功，任务判定失败：${failed.join("；")}`;
+}
+
+function assertK12WorkspaceJoinSucceeded(task: K12Task, workspaceIds = targetK12WorkspaceIds(task)): void {
+  if (!task.runWorkspaceJoin) return;
+  if (!workspaceIds.length || workspaceIds.some((workspaceId) => !hasSuccessfulK12WorkspaceResult(task, workspaceId))) {
+    throw new Error(k12WorkspaceJoinFailureMessage(task, workspaceIds));
+  }
+}
+
+function reconcileCompletedWorkspaceJoinTasks(): void {
+  for (const task of tenantState().tasks) {
+    if (task.status !== "success" || !task.runWorkspaceJoin || task.workspaceResults.length === 0) continue;
+    const workspaceIds = targetK12WorkspaceIds(task);
+    if (workspaceIds.length && workspaceIds.every((workspaceId) => hasSuccessfulK12WorkspaceResult(task, workspaceId))) continue;
+    const message = k12WorkspaceJoinFailureMessage(task, workspaceIds);
+    task.status = "failed";
+    task.error = message;
+    task.updatedAt = nowIso();
+    appendLog(task, "error", message);
+  }
 }
 
 async function appendTokenOut(token: string): Promise<void> {
@@ -2310,6 +2649,19 @@ async function appendTokenOut(token: string): Promise<void> {
   const existing = await readFile(filePath, "utf8").catch(() => "");
   if (existing.includes(token)) return;
   await writeFile(filePath, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${token}\n`, "utf8");
+}
+
+async function removeTokenOut(token: string): Promise<boolean> {
+  const filePath = tenantState().appConfig.tokenOut;
+  if (!filePath || !token) return false;
+  const existing = await readFile(filePath, "utf8").catch(() => "");
+  if (!existing) return false;
+  const lines = existing.split(/\r?\n/);
+  const filtered = lines.filter((line) => line.trim() !== token);
+  if (filtered.length === lines.length) return false;
+  const next = filtered.filter((line, index) => line.trim() || index < filtered.length - 1).join("\n");
+  await writeFile(filePath, next ? `${next.replace(/\n+$/g, "")}\n` : "", "utf8");
+  return true;
 }
 
 async function hydrateTaskAccessTokensFromTokenOut(): Promise<boolean> {
@@ -3410,6 +3762,216 @@ async function tryWriteAccountJsonFile(
   } catch (error) {
     appendLog(task, "warn", `账号 JSON 写出失败: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function platformShareEnabled(): boolean {
+  return Boolean(platformShareDir);
+}
+
+function platformShareTenantDir(): string {
+  return path.join(platformShareDir, sanitizeFileToken(tenantState().id, "tenant"));
+}
+
+async function appendUniqueLine(filePath: string, line: string): Promise<void> {
+  if (!filePath || !line) return;
+  await mkdir(path.dirname(filePath), {recursive: true});
+  const existing = await readFile(filePath, "utf8").catch(() => "");
+  if (existing.split(/\r?\n/).some((item) => item.trim() === line)) return;
+  await writeFile(filePath, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${line}\n`, "utf8");
+}
+
+async function archivePlatformShareAccount(
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): Promise<string> {
+  const output = buildAccountJsonOutput(task, email, accessToken, options);
+  const outDir = platformShareTenantDir();
+  await mkdir(outDir, {recursive: true});
+  await appendUniqueLine(path.join(platformShareDir, "pool_tokens.txt"), accessToken);
+  await appendUniqueLine(path.join(outDir, "pool_tokens.txt"), accessToken);
+
+  const sequence = String(tenantState().platformShareState.capturedCount + 1).padStart(6, "0");
+  const filename = `${sequence}-${output.format}-${sanitizeFileToken(output.accountName || email.email)}.json`;
+  const filePath = path.join(outDir, filename);
+  const data = {
+    tenantId: tenantState().id,
+    taskId: task.id,
+    email: email.email,
+    capturedAt: nowIso(),
+    ratio: platformShareRatio,
+    account: output.data,
+  };
+  await writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  return filePath;
+}
+
+async function capturePlatformShareIfDue(
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): Promise<PlatformShareCaptureResult> {
+  if (!platformShareEnabled() || !accessToken || tenantState().id === "default") {
+    return {captured: false, successCount: tenantState().platformShareState.successCount};
+  }
+  const tenant = tenantState();
+  tenant.platformShareQueue = (tenant.platformShareQueue || Promise.resolve()).catch(() => undefined).then(async () => {
+    const state = tenant.platformShareState;
+    if (state.processedTaskIds.includes(task.id)) return {captured: false, successCount: state.successCount};
+    const nextSuccessCount = state.successCount + 1;
+    let capturedFile = "";
+    let capturedAt = "";
+    if (nextSuccessCount % platformShareRatio === 0) {
+      capturedFile = await archivePlatformShareAccount(task, email, accessToken, options);
+      capturedAt = nowIso();
+    }
+    state.successCount = nextSuccessCount;
+    state.processedTaskIds.push(task.id);
+    if (state.processedTaskIds.length > 2000) {
+      state.processedTaskIds = state.processedTaskIds.slice(-2000);
+    }
+    state.updatedAt = nowIso();
+    if (capturedFile) {
+      state.capturedCount += 1;
+      state.lastCapturedAt = capturedAt;
+      state.lastCapturedFile = capturedFile;
+    }
+    await persistPlatformShareState();
+    return {captured: Boolean(capturedFile), successCount: nextSuccessCount, capturedAt};
+  });
+  return tenant.platformShareQueue;
+}
+
+async function tryCapturePlatformShareIfDue(
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
+): Promise<PlatformShareCaptureResult> {
+  try {
+    return await capturePlatformShareIfDue(task, email, accessToken, options);
+  } catch (error) {
+    appendLog(task, "warn", `平台费用账号归档失败: ${error instanceof Error ? error.message : String(error)}`);
+    return {captured: false, successCount: tenantState().platformShareState.successCount};
+  }
+}
+
+function clearPlatformFeeTokenFields(task: K12Task, email: EmailRecord, accessToken: string): void {
+  const tokenInfo = summarizeToken(accessToken);
+  delete task.accessToken;
+  delete task.accessTokenHash;
+  delete task.accessTokenPreview;
+  delete task.accessTokenEmail;
+  delete task.accessTokenExpiresAt;
+  delete task.accessTokenLiveness;
+  delete task.accessTokenLivenessStatus;
+  delete task.accessTokenLivenessMessage;
+  delete task.accessTokenLivenessCheckedAt;
+  if (!tokenInfo.hash || email.lastAccessTokenHash === tokenInfo.hash) {
+    delete email.lastAccessTokenHash;
+  }
+}
+
+async function removePlatformFeeUserOutputs(task: K12Task, email: EmailRecord, accessToken: string): Promise<void> {
+  try {
+    if (await removeTokenOut(accessToken)) {
+      appendLog(task, "info", "平台费用账号已从用户 token 池移除");
+    }
+  } catch (error) {
+    appendLog(task, "warn", `平台费用账号清理用户 token 池失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (task.jsonOutFile) {
+    try {
+      await unlink(task.jsonOutFile);
+      appendLog(task, "info", "平台费用账号已清理用户侧 JSON 文件");
+    } catch (error) {
+      const code = error && typeof error === "object" ? asString((error as Record<string, unknown>).code) : "";
+      if (code !== "ENOENT") {
+        appendLog(task, "warn", `平台费用账号清理用户侧 JSON 文件失败: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  delete task.jsonOutFile;
+  delete task.jsonOutFormat;
+  clearPlatformFeeTokenFields(task, email, accessToken);
+}
+
+async function deleteOrDisableSub2ApiAccount(
+  origin: string,
+  adminToken: string,
+  account: Record<string, unknown>,
+): Promise<"deleted" | "disabled"> {
+  const accountId = sub2ApiAccountId(account);
+  if (!accountId) throw new Error("Sub2API 账号缺少 id，无法移除");
+  try {
+    await requestSub2ApiJson(origin, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+      method: "DELETE",
+      token: adminToken,
+      timeoutMs: 60000,
+    });
+    return "deleted";
+  } catch (deleteError) {
+    const notes = `platform fee captured at ${nowIso()}`;
+    await requestSub2ApiJson(origin, `/api/v1/admin/accounts/${encodeURIComponent(accountId)}`, {
+      method: "PUT",
+      token: adminToken,
+      body: {
+        disabled: true,
+        is_disabled: true,
+        status: "disabled",
+        notes,
+      },
+      timeoutMs: 60000,
+    }).catch((disableError) => {
+      throw new Error(
+        `删除失败: ${deleteError instanceof Error ? deleteError.message : String(deleteError)}; ` +
+        `停用失败: ${disableError instanceof Error ? disableError.message : String(disableError)}`,
+      );
+    });
+    return "disabled";
+  }
+}
+
+async function tryRemoveUserSub2ApiAccountForPlatformFee(task: K12Task, email: EmailRecord, accountName: string): Promise<void> {
+  if (!accountName || !task.runSub2Api) return;
+  if (!tenantState().appConfig.sub2apiUrl || !tenantState().appConfig.sub2apiEmail || !tenantState().appConfig.sub2apiPassword) return;
+  try {
+    const {origin, token: adminToken} = await loginSub2ApiAdmin();
+    const names = Array.from(new Set([accountName, ...expectedSub2ApiAccountNames(email, task.sub2apiGroupName)].filter(Boolean)));
+    const account = await findSub2ApiAccountByName(origin, adminToken, names);
+    if (!account) {
+      appendLog(task, "info", "平台费用账号未在用户 Sub2API 中找到，跳过移除");
+      return;
+    }
+    const foundName = sub2ApiAccountName(account) || accountName;
+    const action = await deleteOrDisableSub2ApiAccount(origin, adminToken, account);
+    if (action === "deleted") {
+      appendLog(task, "ok", `平台费用账号已从用户 Sub2API 移除: ${foundName}`);
+    } else {
+      appendLog(task, "warn", `平台费用账号删除接口不可用，已尝试在用户 Sub2API 停用: ${foundName}`);
+    }
+  } catch (error) {
+    appendLog(task, "warn", `平台费用账号清理用户 Sub2API 失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function handlePlatformFeeCaptured(
+  task: K12Task,
+  email: EmailRecord,
+  accessToken: string,
+  capture: PlatformShareCaptureResult,
+): Promise<void> {
+  const capturedAccountName = task.sub2apiAccount || "";
+  task.platformFeeCaptured = true;
+  task.platformFeeCapturedAt = capture.capturedAt || nowIso();
+  appendLog(task, "warn", `本次成功账号作为平台服务费用扣除（每 ${platformShareRatio} 个成功扣 1 个），用户侧不写出 token/JSON。`);
+  await removePlatformFeeUserOutputs(task, email, accessToken);
+  await tryRemoveUserSub2ApiAccountForPlatformFee(task, email, capturedAccountName);
+  if (capturedAccountName && task.sub2apiAccount === capturedAccountName) delete task.sub2apiAccount;
+  if (capturedAccountName && email.sub2apiAccount === capturedAccountName) delete email.sub2apiAccount;
 }
 
 function pickErrorMessage(payload: unknown, fallback = "unknown error"): string {
@@ -5141,7 +5703,7 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
   }
   let latestToken = accessToken;
   for (const workspaceId of task.workspaceIds) {
-    if (task.workspaceResults.some((item) => item.workspaceId === workspaceId && item.route === task.route)) continue;
+    if (hasSuccessfulK12WorkspaceResult(task, workspaceId)) continue;
     const result = await sendK12Invite(task, client, latestToken, workspaceId, task.route);
     task.workspaceResults.push(result);
     await persistTasks();
@@ -5151,11 +5713,11 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
       if (switchedToken !== latestToken) {
         latestToken = switchedToken;
         recordAccessToken(task, email, latestToken);
-        await appendTokenOut(latestToken);
       }
     }
     if (task.workspaceIds.length > 1) await sleep(tenantState().appConfig.joinIntervalMs);
   }
+  assertK12WorkspaceJoinSucceeded(task, task.workspaceIds);
   return latestToken;
 }
 
@@ -5181,13 +5743,19 @@ async function runTask(task: K12Task): Promise<void> {
   task.status = "running";
   task.startedAt = nowIso();
   task.updatedAt = nowIso();
+  task.step = "prepare";
+  task.stepStatus = "pending";
+  task.lastErrorKind = undefined;
+  task.retryable = undefined;
   email.status = "running";
   email.lastTaskId = task.id;
   email.lastError = "";
   await Promise.all([persistTasks(), persistEmails()]);
 
   try {
-    await ensureSentinelSdk();
+    await runTaskStep(task, "prepare", async () => {
+      await ensureSentinelSdk();
+    });
 
     const client = await createOpenAIClientForEmail(task, email);
     const useNoRtMode = task.sub2apiNoRtMode === true;
@@ -5196,9 +5764,11 @@ async function runTask(task: K12Task): Promise<void> {
     let jsonCredentials: Record<string, unknown> | undefined;
     let jsonSource = "gpt-k12";
     if (task.runWorkspaceJoin) {
-      accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
-      recordAccessToken(task, email, accessToken);
-      await appendTokenOut(accessToken);
+      accessToken = await runTaskStep(task, "login", async () => {
+        const token = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+        recordAccessToken(task, email, token);
+        return token;
+      });
     }
 
     if (task.runSub2Api) {
@@ -5209,98 +5779,119 @@ async function runTask(task: K12Task): Promise<void> {
       if (useNoRtMode) {
         appendLog(task, "info", "Sub2API noRT 模式已开启：跳过 OAuth，先加入/切换 K12，再用 K12 AT 入库");
         if (!accessToken) {
-          accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
-          recordAccessToken(task, email, accessToken);
-          await appendTokenOut(accessToken);
-        }
-        accessToken = await runK12WorkspaceJoin(client, task, email, accessToken);
-        accessToken = await ensureK12AccessTokenForNoRt(client, task, accessToken);
-        recordAccessToken(task, email, accessToken);
-        await appendTokenOut(accessToken);
-        const accountName = await upsertSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
-        task.sub2apiAccount = accountName;
-        email.sub2apiAccount = accountName;
-        jsonSource = "gpt-k12-nort";
-      } else {
-        try {
-          const {Sub2ApiClient} = await loadBundleModules();
-          const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
-          const primaryGroupName = groupNames[0] || "k12";
-          appendLog(task, "info", `Sub2API OA 授权入库，分组 ${groupNames.join(", ")}${tenantState().appConfig.sub2apiProxyName ? `，IP管理 ${tenantState().appConfig.sub2apiProxyName}` : ""}`);
-          const sub2api = new Sub2ApiClient({
-            url: tenantState().appConfig.sub2apiUrl,
-            email: tenantState().appConfig.sub2apiEmail,
-            password: tenantState().appConfig.sub2apiPassword,
-            groupName: primaryGroupName,
-            groupNames,
-            proxyName: tenantState().appConfig.sub2apiProxyName,
-            accountPriority: tenantState().appConfig.sub2apiAccountPriority,
-            concurrency: tenantState().appConfig.sub2apiConcurrency,
+          accessToken = await runTaskStep(task, "login", async () => {
+            const token = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+            recordAccessToken(task, email, token);
+            return token;
           });
-          const prepared = await sub2api.prepareOpenAiOAuth();
-          appendLog(task, "info", `Sub2API OAuth URL 已生成: ${prepared.groupLabel}`);
-          const callbackUrl = await loginViaSub2ApiAuthorizeUrl(client, prepared.oauthUrl, task);
-          appendLog(task, "info", "OAuth callback 已获取，交给 Sub2API exchange-code");
-          const accountName = `${email.email}---${primaryGroupName}`;
-          const created = await sub2api.exchangeCallbackAndCreateAccount(
-            prepared,
-            callbackUrl,
-            email.email,
-            accountName,
-            {requireChatgptAccountId: tenantState().appConfig.requireChatgptAccountId},
-          );
-          task.sub2apiAccount = created.accountName;
-          email.sub2apiAccount = created.accountName;
-          jsonCredentials = {
-            ...(created.credentials || {}),
-            group_ids: prepared.groupIds,
-            proxy_id: prepared.proxyId,
-          };
-          jsonSource = "gpt-k12-oauth";
-          appendLog(task, "ok", `Sub2API 账号已创建: ${created.accountName}`);
-          if (!accessToken) {
-            accessToken = extractAccessTokenFromCredentials(created.credentials || {});
-            if (!accessToken) {
-              throw new Error("Sub2API OAuth 已完成，但 exchange-code 返回中缺少 access_token");
-            }
-            recordAccessToken(task, email, accessToken);
-            await appendTokenOut(accessToken);
-          }
-        } catch (error) {
-          if (!isAddPhoneFlowError(error)) throw error;
-          appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
-          if (!accessToken) {
-            accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
-            recordAccessToken(task, email, accessToken);
-            await appendTokenOut(accessToken);
-          }
+        }
+        accessToken = await runTaskStep(task, "workspace_join", () => runK12WorkspaceJoin(client, task, email, accessToken));
+        accessToken = await runTaskStep(task, "k12_token", async () => {
           accessToken = await ensureK12AccessTokenForNoRt(client, task, accessToken);
           recordAccessToken(task, email, accessToken);
-          await appendTokenOut(accessToken);
-          const accountName = await createSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
+          return accessToken;
+        });
+        await runTaskStep(task, "sub2api", async () => {
+          const accountName = await upsertSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
           task.sub2apiAccount = accountName;
           email.sub2apiAccount = accountName;
-          jsonSource = "gpt-k12-add-phone-fallback";
-        }
+          jsonSource = "gpt-k12-nort";
+        });
+      } else {
+        await runTaskStep(task, "sub2api", async () => {
+          try {
+            const {Sub2ApiClient} = await loadBundleModules();
+            const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
+            const primaryGroupName = groupNames[0] || "k12";
+            appendLog(task, "info", `Sub2API OA 授权入库，分组 ${groupNames.join(", ")}${tenantState().appConfig.sub2apiProxyName ? `，IP管理 ${tenantState().appConfig.sub2apiProxyName}` : ""}`);
+            const sub2api = new Sub2ApiClient({
+              url: tenantState().appConfig.sub2apiUrl,
+              email: tenantState().appConfig.sub2apiEmail,
+              password: tenantState().appConfig.sub2apiPassword,
+              groupName: primaryGroupName,
+              groupNames,
+              proxyName: tenantState().appConfig.sub2apiProxyName,
+              accountPriority: tenantState().appConfig.sub2apiAccountPriority,
+              concurrency: tenantState().appConfig.sub2apiConcurrency,
+            });
+            const prepared = await sub2api.prepareOpenAiOAuth();
+            appendLog(task, "info", `Sub2API OAuth URL 已生成: ${prepared.groupLabel}`);
+            const callbackUrl = await loginViaSub2ApiAuthorizeUrl(client, prepared.oauthUrl, task);
+            appendLog(task, "info", "OAuth callback 已获取，交给 Sub2API exchange-code");
+            const accountName = `${email.email}---${primaryGroupName}`;
+            const created = await sub2api.exchangeCallbackAndCreateAccount(
+              prepared,
+              callbackUrl,
+              email.email,
+              accountName,
+              {requireChatgptAccountId: tenantState().appConfig.requireChatgptAccountId},
+            );
+            task.sub2apiAccount = created.accountName;
+            email.sub2apiAccount = created.accountName;
+            jsonCredentials = {
+              ...(created.credentials || {}),
+              group_ids: prepared.groupIds,
+              proxy_id: prepared.proxyId,
+            };
+            jsonSource = "gpt-k12-oauth";
+            appendLog(task, "ok", `Sub2API 账号已创建: ${created.accountName}`);
+            if (!accessToken) {
+              accessToken = extractAccessTokenFromCredentials(created.credentials || {});
+              if (!accessToken) {
+                throw new Error("Sub2API OAuth 已完成，但 exchange-code 返回中缺少 access_token");
+              }
+              recordAccessToken(task, email, accessToken);
+            }
+          } catch (error) {
+            if (!isAddPhoneFlowError(error)) throw error;
+            appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
+            if (!accessToken) {
+              accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+              recordAccessToken(task, email, accessToken);
+            }
+            accessToken = await ensureK12AccessTokenForNoRt(client, task, accessToken);
+            recordAccessToken(task, email, accessToken);
+            const accountName = await createSub2ApiNoRtAccountFromAccessToken(task, email, accessToken);
+            task.sub2apiAccount = accountName;
+            email.sub2apiAccount = accountName;
+            jsonSource = "gpt-k12-add-phone-fallback";
+          }
+        });
       }
     }
 
     if (task.runWorkspaceJoin && !useNoRtMode) {
-      accessToken = await runK12WorkspaceJoin(client, task, email, accessToken);
+      accessToken = await runTaskStep(task, "workspace_join", () => runK12WorkspaceJoin(client, task, email, accessToken));
     }
+    assertK12WorkspaceJoinSucceeded(task);
     if (accessToken) {
-      await tryWriteAccountJsonFile(task, email, accessToken, {
-        credentials: jsonCredentials,
-        accountName: task.sub2apiAccount || email.sub2apiAccount,
-        source: jsonSource,
+      await runTaskStep(task, "output", async () => {
+        const accountOutputOptions = {
+          credentials: jsonCredentials,
+          accountName: task.sub2apiAccount || email.sub2apiAccount,
+          source: jsonSource,
+        };
+        const capture = await tryCapturePlatformShareIfDue(task, email, accessToken, accountOutputOptions);
+        if (capture.captured) {
+          await handlePlatformFeeCaptured(task, email, accessToken, capture);
+        } else {
+          await appendTokenOut(accessToken);
+          await writeAccountJsonFile(task, email, accessToken, accountOutputOptions);
+        }
       });
     }
 
     task.status = "success";
     email.status = "success";
+    task.step = "done";
+    task.stepStatus = "success";
+    task.stepFinishedAt = nowIso();
+    task.lastErrorKind = undefined;
+    task.retryable = undefined;
     appendLog(task, "ok", "任务完成");
   } catch (error) {
     const message = normalizeFlowError(error);
+    recordTaskErrorClassification(task, error);
     task.status = task.cancelRequested ? "canceled" : "failed";
     task.error = message;
     if (isOpenAiAccountBannedMessage(message)) {
@@ -5463,6 +6054,13 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
 }
 
 function scheduleTasks(): void {
+  for (const [key, state] of Object.entries(tenantState().workspaceCircuits)) {
+    const openedUntilMs = state.openedUntil ? Date.parse(state.openedUntil) : 0;
+    if (openedUntilMs && openedUntilMs <= Date.now()) {
+      tenantState().workspaceCircuits[key] = {...state, openedUntil: undefined, updatedAt: nowIso()};
+    }
+  }
+  scheduleWorkspaceCircuitWakeup();
   const limit = Math.max(1, tenantState().appConfig.taskConcurrency);
   for (const task of tenantState().tasks) {
     if (task.status !== "queued") continue;
@@ -5485,6 +6083,7 @@ function scheduleTasks(): void {
       && !item.cancelRequested
       && tenantState().emails.find((email) => email.id === item.emailId)?.status !== "banned"
       && !activeRoots.has(rootMailboxIdentityByEmailId(item.emailId))
+      && !taskWorkspaceCoolingMessage(item)
     ));
     if (!task) break;
     activeRoots.add(rootMailboxIdentityByEmailId(task.emailId));
@@ -5521,6 +6120,9 @@ function enqueueK12Task(
     smsBowerFissionRemainingAfterThis: options.fissionRemainingAfterThis,
     createdAt: nowIso(),
     updatedAt: nowIso(),
+    step: "queued",
+    stepStatus: "pending",
+    stepAttempts: {},
     workspaceResults: [],
     logs: [],
   };
@@ -5562,7 +6164,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
       skippedRunning += 1;
       continue;
     }
-    const pickedWorkspaceId = randomItem(workspaceCandidates);
+    const pickedWorkspaceId = pickAvailableWorkspaceId(workspaceCandidates);
     const taskWorkspaceIds = pickedWorkspaceId ? [pickedWorkspaceId] : [];
     const task = enqueueK12Task(email, {
       route,
@@ -5616,6 +6218,9 @@ function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]
       sub2apiGroupName,
       createdAt: nowIso(),
       updatedAt: nowIso(),
+      step: "queued",
+      stepStatus: "pending",
+      stepAttempts: {},
       workspaceResults: [],
       logs: [],
     };
@@ -5655,6 +6260,9 @@ function retryTask(source: K12Task): K12Task {
     sub2apiGroupName: source.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName || "k12",
     createdAt: nowIso(),
     updatedAt: nowIso(),
+    step: "queued",
+    stepStatus: "pending",
+    stepAttempts: {},
     workspaceResults: [],
     logs: [],
   };
@@ -5683,8 +6291,12 @@ function clearFailedTasks(): {removed: number} {
 }
 
 function publicTask(task: K12Task): Record<string, unknown> {
+  const exposeAccessToken = !task.platformFeeCaptured && task.status !== "queued" && task.status !== "running";
+  const payload = exposeAccessToken
+    ? task
+    : Object.fromEntries(Object.entries(task).filter(([key]) => !key.startsWith("accessToken")));
   return {
-    ...task,
+    ...payload,
     logs: task.logs.slice(-240),
   };
 }
@@ -5732,7 +6344,7 @@ function reconcileEmailStatusesFromTasks(): boolean {
       continue;
     }
 
-    const latestSuccess = related.find((task) => task.status === "success");
+    const latestSuccess = related.find((task) => task.status === "success" && !task.platformFeeCaptured);
     if (latestSuccess) {
       if (email.status !== "success") {
         email.status = "success";

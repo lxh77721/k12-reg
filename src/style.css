@@ -818,6 +818,12 @@ input[type="checkbox"] {
   background: rgba(251, 191, 36, 0.12);
 }
 
+.liveness-badge.fee {
+  color: #f9a8d4;
+  border-color: rgba(236, 72, 153, 0.36);
+  background: rgba(236, 72, 153, 0.12);
+}
+
 .email-meta-row {
   display: flex;
   align-items: center;
