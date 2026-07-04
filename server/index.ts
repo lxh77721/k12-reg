@@ -370,36 +370,30 @@ function asNumber(value: unknown, fallback: number, min = Number.NEGATIVE_INFINI
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
-const REQUIRED_PROXY_FORMAT = "username:password@hostname:port";
+const PROXY_CONFIG_HINT = "host:port、username:password@host:port、http://host:port、http://username:password@host:port、socks5://host:port，或 direct";
 
 function requiredProxyConfigError(): string {
-  return `请先在设置中配置 OpenAI 代理，格式为 ${REQUIRED_PROXY_FORMAT}`;
+  return `请先在设置中配置 OpenAI 代理，支持 ${PROXY_CONFIG_HINT}`;
 }
 
-function parseRequiredProxyConfig(value: unknown): {raw: string; dispatcherUrl: string} | null {
+function invalidProxyConfigError(): string {
+  return `OpenAI 代理格式不正确，支持 ${PROXY_CONFIG_HINT}`;
+}
+
+function normalizeProxyConfig(value: unknown): {raw: string; dispatcherUrl: string; direct: boolean} | null {
   const raw = asString(value);
-  if (!raw || raw.toLowerCase() === "direct" || /^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return null;
-  if (/[\s/?#]/.test(raw)) return null;
-  const atIndex = raw.indexOf("@");
-  if (atIndex <= 0 || atIndex !== raw.lastIndexOf("@")) return null;
-  const auth = raw.slice(0, atIndex);
-  const hostPort = raw.slice(atIndex + 1);
-  const passwordSeparator = auth.indexOf(":");
-  if (passwordSeparator <= 0 || passwordSeparator === auth.length - 1) return null;
-  const portSeparator = hostPort.lastIndexOf(":");
-  if (portSeparator <= 0 || portSeparator === hostPort.length - 1) return null;
-  const username = auth.slice(0, passwordSeparator);
-  const password = auth.slice(passwordSeparator + 1);
-  const host = hostPort.slice(0, portSeparator);
-  const port = hostPort.slice(portSeparator + 1);
-  const portNumber = Number(port);
-  if (!username || !password || !host || /[:@]/.test(host) || !/^\d{1,5}$/.test(port)) return null;
-  if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return null;
+  if (!raw) return null;
+  if (raw.toLowerCase() === "direct") return {raw: "direct", dispatcherUrl: "", direct: true};
+  if (/\s/.test(raw)) return null;
+  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+  const urlText = hasScheme ? raw : `http://${raw}`;
   try {
-    const url = new URL(`http://${host}:${port}`);
-    url.username = username;
-    url.password = password;
-    return {raw, dispatcherUrl: url.toString()};
+    const url = new URL(urlText);
+    if (!url.hostname) return null;
+    if ((url.pathname && url.pathname !== "/") || url.search || url.hash) return null;
+    if (!hasScheme && !url.port) return null;
+    const normalized = url.toString().replace(/\/$/g, "");
+    return {raw: normalized, dispatcherUrl: normalized, direct: false};
   } catch {
     return null;
   }
@@ -408,8 +402,8 @@ function parseRequiredProxyConfig(value: unknown): {raw: string; dispatcherUrl: 
 function proxyUrlForDispatcher(value: unknown): string {
   const raw = asString(value);
   if (!raw || raw.toLowerCase() === "direct") return "";
-  const required = parseRequiredProxyConfig(raw);
-  return required?.dispatcherUrl || raw;
+  const proxy = normalizeProxyConfig(raw);
+  return proxy?.dispatcherUrl || raw;
 }
 
 function maskProxyForLog(value: unknown): string {
@@ -425,10 +419,14 @@ function maskProxyForLog(value: unknown): string {
   }
 }
 
-function assertTenantProxyConfigured(): {raw: string; dispatcherUrl: string} {
-  const parsed = parseRequiredProxyConfig(tenantState().appConfig?.defaultProxyUrl);
-  if (!parsed) throw new Error(requiredProxyConfigError());
-  return parsed;
+function proxyUrlForClient(proxy: {dispatcherUrl: string; direct: boolean}): string {
+  return proxy.direct ? "" : proxy.dispatcherUrl;
+}
+
+function assertTenantProxyConfigured(): {raw: string; dispatcherUrl: string; direct: boolean} {
+  const proxy = normalizeProxyConfig(tenantState().appConfig?.defaultProxyUrl);
+  if (!proxy) throw new Error(requiredProxyConfigError());
+  return proxy;
 }
 
 function parseStringList(value: unknown): string[] {
@@ -659,7 +657,7 @@ async function loadTenantRuntime(tenant: TenantRuntime): Promise<TenantRuntime> 
     await mkdir(tenant.dir, {recursive: true});
     tenant.appConfig = await loadConfig();
     await saveConfig(tenant.appConfig);
-    if (parseRequiredProxyConfig(tenant.appConfig.defaultProxyUrl)) {
+    if (normalizeProxyConfig(tenant.appConfig.defaultProxyUrl)) {
       await ensureSentinelSdk();
     }
     tenant.emails = await readJson<EmailRecord[]>(tenant.emailsFile, []);
@@ -2427,6 +2425,7 @@ function normalizeFlowError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (isOpenAiAccountBannedMessage(message)) return "GPT 账号已被 OpenAI 停用/封禁";
   if (isOpenAiUnsupportedCountryError(message)) return "OpenAI auth unsupported_country：当前代理/出口国家或地区不可用，请更换支持 OpenAI 的代理出口后重试";
+  if (isChatGptBrowserChallengeError(message)) return "打开 chatgpt.com 失败: HTTP 403，ChatGPT 要求浏览器 JavaScript/cookie 验证；当前 fetch 自动化会被边缘风控拦截，请改用可正常访问 chatgpt.com 的真实浏览器会话/合规登录环境";
   if (isAddPhoneFlowError(error)) {
     return "登录后触发 add-phone 手机接码页面，按 K12 规则判定失败";
   }
@@ -2438,7 +2437,7 @@ function classifyTaskError(error: unknown): {kind: TaskErrorKind; retryable: boo
   if (/任务已取消/.test(message)) return {kind: "canceled", retryable: false};
   if (isOpenAiAccountBannedMessage(message)) return {kind: "fatal", retryable: false};
   if (
-    /密码错误|invalid_username_or_password|PasswordVerify|domain can request access|Only users with emails on the same domain|add-phone|add-email|unsupported_country|services are not available in your country|not available in your country|缺少 chatgpt_account_id|不是 K12 上下文|未切到 K12|cannot request access/i.test(message)
+    /密码错误|invalid_username_or_password|PasswordVerify|domain can request access|Only users with emails on the same domain|add-phone|add-email|unsupported_country|services are not available in your country|not available in your country|ChatGPT 要求浏览器 JavaScript\/cookie 验证|边缘风控拦截|缺少 chatgpt_account_id|不是 K12 上下文|未切到 K12|cannot request access/i.test(message)
   ) {
     return {kind: "fatal", retryable: false};
   }
@@ -2543,12 +2542,18 @@ function isOpenAiUnsupportedCountryError(value: unknown): boolean {
   return /unsupported_country|services are not available in your country|not available in your country/i.test(errorText(value));
 }
 
+function isChatGptBrowserChallengeError(value: unknown): boolean {
+  const message = errorText(value);
+  return /(?:打开|鎵撳紑)\s*chatgpt\.com.*(?:HTTP\s*)?403|chatgpt\.com.*(?:Enable JavaScript and cookies|Cloudflare|cf_chl|browser challenge)/i.test(message);
+}
+
 function isOpenAiRateLimitError(value: unknown): boolean {
   return /(?:HTTP\s*)?429\b|rate_limit_exceeded|too many requests|被限流|限流/i.test(errorText(value));
 }
 
 function isOpenAiAuthTransientError(value: unknown): boolean {
   const message = errorText(value);
+  if (isInvalidAuthStateError(message)) return false;
   return isOpenAiRateLimitError(message)
     || /(?:HTTP\s*)?(408|409|425|500|502|503|504)\b|timeout|timed out|超时|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket|network|fetch failed|Internal Server Error/i.test(message);
 }
@@ -2579,6 +2584,25 @@ function openAiAuthCircuitMessage(): string {
   return `OpenAI auth 熔断冷却中，剩余 ${Math.ceil(remaining / 1000)}s，最近错误 ${status}: ${state.lastError || "-"}`;
 }
 
+function clearOpenAiAuthCircuitForInvalidState(error?: unknown): void {
+  const state = tenantState().openAiAuthCircuit;
+  tenantState().openAiAuthCircuit = {
+    failureCount: 0,
+    nextAvailableAt: new Date(Date.now() + OPENAI_AUTH_MIN_INTERVAL_MS).toISOString(),
+    lastStatus: error === undefined ? state.lastStatus : extractHttpStatus(error),
+    lastError: error === undefined ? state.lastError : normalizeFlowError(error).slice(0, 300),
+    updatedAt: nowIso(),
+  };
+  scheduleOpenAiAuthCircuitWakeup();
+}
+
+function clearInvalidStateAuthCooldownIfNeeded(): boolean {
+  const state = tenantState().openAiAuthCircuit;
+  if (!state.openedUntil || !state.lastError || !isInvalidAuthStateError(state.lastError)) return false;
+  clearOpenAiAuthCircuitForInvalidState();
+  return true;
+}
+
 function scheduleOpenAiAuthCircuitWakeup(): void {
   const tenant = tenantState();
   if (tenant.openAiAuthCircuitTimer) {
@@ -2604,6 +2628,7 @@ function scheduleOpenAiAuthCircuitWakeup(): void {
 }
 
 async function waitForOpenAiAuthCircuit(task?: K12Task): Promise<void> {
+  if (clearInvalidStateAuthCooldownIfNeeded()) return;
   const remaining = openAiAuthCooldownRemainingMs();
   if (remaining <= 0) return;
   const message = openAiAuthCircuitMessage();
@@ -2632,6 +2657,10 @@ function recordOpenAiAuthSuccess(): void {
 }
 
 function recordOpenAiAuthFailure(error: unknown, task?: K12Task): void {
+  if (isInvalidAuthStateError(error)) {
+    clearOpenAiAuthCircuitForInvalidState(error);
+    return;
+  }
   const state = tenantState().openAiAuthCircuit;
   const message = normalizeFlowError(error).slice(0, 300);
   const failureCount = (state.failureCount || 0) + 1;
@@ -2679,14 +2708,16 @@ async function runOpenAiAuthRequest<T>(
         return result;
       } catch (error) {
         lastError = error;
-        if (options.restartOnInvalidState && isInvalidAuthStateError(error)) {
-          tenantState().openAiAuthCircuit = {
-            ...tenantState().openAiAuthCircuit,
-            nextAvailableAt: new Date(Date.now() + OPENAI_AUTH_MIN_INTERVAL_MS).toISOString(),
-            updatedAt: nowIso(),
-          };
+        if (isInvalidAuthStateError(error)) {
+          clearOpenAiAuthCircuitForInvalidState(error);
           if (task) {
-            appendLog(task, "warn", `OpenAI auth ${label} state 已失效，丢弃当前浏览器会话后重试`);
+            appendLog(
+              task,
+              "warn",
+              options.restartOnInvalidState
+                ? `OpenAI auth ${label} state 已失效，丢弃当前浏览器会话后重试`
+                : `OpenAI auth ${label} state 已失效，停止复用当前登录会话`,
+            );
             await persistTasks().catch(() => undefined);
           }
           throw error;
@@ -3195,6 +3226,11 @@ async function continueAuthSteps(
       try {
         continueUrl = await sendEmailOtpForLogin(client, task, `${AUTH_BASE_URL}/log-in/password`);
       } catch (error) {
+        if (isInvalidAuthStateError(error) && task) {
+          log("warn", "邮箱验证码发送 state 已失效，重新打开 ChatGPT auth 入口后接管流程");
+          continueUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
+          continue;
+        }
         throw new Error(
           `账号当前被 OpenAI 判定为密码登录步骤，已按配置尝试邮箱验证码登录，但 OpenAI 未允许发送邮箱验证码；该账号无法仅凭邮箱接码登录。原始错误：${error instanceof Error ? error.message : String(error)}`,
         );
@@ -3280,8 +3316,9 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (isInvalidAuthStateError(error)) {
-      appendLog(task, "warn", "登录 auth session 已失效，当前浏览器会话作废");
-      throw error;
+      appendLog(task, "warn", "登录 auth session 已失效，重新打开 ChatGPT auth 入口后接管流程");
+      const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
+      await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
     } else if (isInvalidPasswordError(error)) {
       appendLog(task, "warn", "登录流程进入密码验证失败；按配置改走邮箱验证码登录");
       await continueAuthSteps(client, `${AUTH_BASE_URL}/log-in/password`, task, {finishChatGptCallback: true});
@@ -3312,8 +3349,10 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
         await runOpenAiAuthRequest(task, "ChatGPTWebLoginRetry", () => client.authLoginChatGPTWeb(), {restartOnInvalidState: true});
       } catch (retryError) {
         if (isInvalidAuthStateError(retryError)) {
-          appendLog(task, "warn", "重试后 auth session 仍失效，当前浏览器会话作废");
-          throw retryError;
+          appendLog(task, "warn", "重试后 auth session 仍失效，重新打开 ChatGPT auth 入口后接管流程");
+          const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
+          await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
+          return String(await client.getChatGPTAccessToken());
         }
         if (isEmailOtpSendStepError(retryError)) {
           appendLog(task, "warn", "重试后进入邮箱验证码流程，开始邮件接码");
@@ -5587,7 +5626,7 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
   return new OpenAIClient({
     email: email.email,
     password: tenantState().appConfig.defaultPassword,
-    proxyUrl: proxy.raw,
+    proxyUrl: proxyUrlForClient(proxy),
     openaiFetchTimeoutMs: tenantState().appConfig.openaiFetchTimeoutMs,
     deviceProfile: generateRandomDeviceProfile(),
     signupScreenHint: "signup",
@@ -6360,6 +6399,7 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
 }
 
 function scheduleTasks(): void {
+  clearInvalidStateAuthCooldownIfNeeded();
   const authOpenedUntilMs = openAiAuthCircuitOpenedUntilMs();
   if (authOpenedUntilMs && authOpenedUntilMs <= Date.now()) {
     tenantState().openAiAuthCircuit = {
@@ -6873,9 +6913,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     });
     const proxyRaw = asString(merged.defaultProxyUrl);
     if (proxyRaw) {
-      const proxy = parseRequiredProxyConfig(proxyRaw);
+      const proxy = normalizeProxyConfig(proxyRaw);
       if (!proxy) {
-        sendJson(res, 409, {error: requiredProxyConfigError()});
+        sendJson(res, 409, {error: invalidProxyConfigError()});
         return;
       }
       merged.defaultProxyUrl = proxy.raw;
@@ -7111,7 +7151,7 @@ async function boot(): Promise<void> {
   await mkdir(tenantsDir, {recursive: true});
   const defaultTenant = await getTenantRuntime("default");
   currentTenant = defaultTenant;
-  if (parseRequiredProxyConfig(defaultTenant.appConfig.defaultProxyUrl)) {
+  if (normalizeProxyConfig(defaultTenant.appConfig.defaultProxyUrl)) {
     await ensureSentinelSdk();
   }
   createServer((req, res) => {

@@ -42,27 +42,13 @@ const AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS = [8000, 15000, 30000];
 function proxyUrlForDispatcher(value: unknown): string {
     const raw = String(value ?? "").trim();
     if (!raw || raw.toLowerCase() === "direct") return "";
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
-    if (/[\s/?#]/.test(raw)) return raw;
-    const atIndex = raw.indexOf("@");
-    if (atIndex <= 0 || atIndex !== raw.lastIndexOf("@")) return raw;
-    const auth = raw.slice(0, atIndex);
-    const hostPort = raw.slice(atIndex + 1);
-    const passwordSeparator = auth.indexOf(":");
-    const portSeparator = hostPort.lastIndexOf(":");
-    if (passwordSeparator <= 0 || passwordSeparator === auth.length - 1 || portSeparator <= 0 || portSeparator === hostPort.length - 1) return raw;
-    const username = auth.slice(0, passwordSeparator);
-    const password = auth.slice(passwordSeparator + 1);
-    const host = hostPort.slice(0, portSeparator);
-    const port = hostPort.slice(portSeparator + 1);
-    const portNumber = Number(port);
-    if (!username || !password || !host || /[:@]/.test(host) || !/^\d{1,5}$/.test(port)) return raw;
-    if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return raw;
+    const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+    if (/\s/.test(raw)) return raw;
     try {
-        const url = new URL(`http://${host}:${port}`);
-        url.username = username;
-        url.password = password;
-        return url.toString();
+        const url = new URL(hasScheme ? raw : `http://${raw}`);
+        if (!url.hostname) return raw;
+        if ((url.pathname && url.pathname !== "/") || url.search || url.hash) return raw;
+        return url.toString().replace(/\/$/g, "");
     } catch {
         return raw;
     }
