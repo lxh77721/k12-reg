@@ -370,6 +370,67 @@ function asNumber(value: unknown, fallback: number, min = Number.NEGATIVE_INFINI
   return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
+const REQUIRED_PROXY_FORMAT = "username:password@hostname:port";
+
+function requiredProxyConfigError(): string {
+  return `请先在设置中配置 OpenAI 代理，格式为 ${REQUIRED_PROXY_FORMAT}`;
+}
+
+function parseRequiredProxyConfig(value: unknown): {raw: string; dispatcherUrl: string} | null {
+  const raw = asString(value);
+  if (!raw || raw.toLowerCase() === "direct" || /^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return null;
+  if (/[\s/?#]/.test(raw)) return null;
+  const atIndex = raw.indexOf("@");
+  if (atIndex <= 0 || atIndex !== raw.lastIndexOf("@")) return null;
+  const auth = raw.slice(0, atIndex);
+  const hostPort = raw.slice(atIndex + 1);
+  const passwordSeparator = auth.indexOf(":");
+  if (passwordSeparator <= 0 || passwordSeparator === auth.length - 1) return null;
+  const portSeparator = hostPort.lastIndexOf(":");
+  if (portSeparator <= 0 || portSeparator === hostPort.length - 1) return null;
+  const username = auth.slice(0, passwordSeparator);
+  const password = auth.slice(passwordSeparator + 1);
+  const host = hostPort.slice(0, portSeparator);
+  const port = hostPort.slice(portSeparator + 1);
+  const portNumber = Number(port);
+  if (!username || !password || !host || /[:@]/.test(host) || !/^\d{1,5}$/.test(port)) return null;
+  if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return null;
+  try {
+    const url = new URL(`http://${host}:${port}`);
+    url.username = username;
+    url.password = password;
+    return {raw, dispatcherUrl: url.toString()};
+  } catch {
+    return null;
+  }
+}
+
+function proxyUrlForDispatcher(value: unknown): string {
+  const raw = asString(value);
+  if (!raw || raw.toLowerCase() === "direct") return "";
+  const required = parseRequiredProxyConfig(raw);
+  return required?.dispatcherUrl || raw;
+}
+
+function maskProxyForLog(value: unknown): string {
+  const urlValue = proxyUrlForDispatcher(value);
+  if (!urlValue) return "direct";
+  try {
+    const url = new URL(urlValue);
+    if (url.username) url.username = "***";
+    if (url.password) url.password = "***";
+    return url.toString().replace(/\/$/g, "");
+  } catch {
+    return maskSecret(String(value || ""), 8, 6);
+  }
+}
+
+function assertTenantProxyConfigured(): {raw: string; dispatcherUrl: string} {
+  const parsed = parseRequiredProxyConfig(tenantState().appConfig?.defaultProxyUrl);
+  if (!parsed) throw new Error(requiredProxyConfigError());
+  return parsed;
+}
+
 function parseStringList(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.map((item) => String(item).trim()).filter(Boolean);
@@ -598,7 +659,9 @@ async function loadTenantRuntime(tenant: TenantRuntime): Promise<TenantRuntime> 
     await mkdir(tenant.dir, {recursive: true});
     tenant.appConfig = await loadConfig();
     await saveConfig(tenant.appConfig);
-    await ensureSentinelSdk();
+    if (parseRequiredProxyConfig(tenant.appConfig.defaultProxyUrl)) {
+      await ensureSentinelSdk();
+    }
     tenant.emails = await readJson<EmailRecord[]>(tenant.emailsFile, []);
     tenant.tasks = await readJson<K12Task[]>(tenant.tasksFile, []);
     tenant.sub2apiRefillHistory = (await readJson<Sub2ApiRefillHistoryEntry[]>(tenant.sub2apiRefillHistoryFile, []))
@@ -648,7 +711,9 @@ async function getTenantRuntime(id: string): Promise<TenantRuntime> {
 }
 
 function buildDownloadFetchOptions(): {dispatcher?: ProxyAgent} {
-  const proxyUrl = tenantState().appConfig?.defaultProxyUrl || process.env.DEFAULT_PROXY_URL || process.env.OPENAI_PROXY_URL || "";
+  const proxyUrl = proxyUrlForDispatcher(
+    tenantState().appConfig?.defaultProxyUrl || process.env.DEFAULT_PROXY_URL || process.env.OPENAI_PROXY_URL || "",
+  );
   if (!proxyUrl || proxyUrl === "direct") return {};
   return {dispatcher: new ProxyAgent(proxyUrl)};
 }
@@ -2593,7 +2658,12 @@ function recordOpenAiAuthFailure(error: unknown, task?: K12Task): void {
   scheduleOpenAiAuthCircuitWakeup();
 }
 
-async function runOpenAiAuthRequest<T>(task: K12Task | undefined, label: string, fn: () => Promise<T>): Promise<T> {
+async function runOpenAiAuthRequest<T>(
+  task: K12Task | undefined,
+  label: string,
+  fn: () => Promise<T>,
+  options: {restartOnInvalidState?: boolean} = {},
+): Promise<T> {
   const tenant = tenantState();
   const previous = tenant.openAiAuthQueue || Promise.resolve();
   const run = previous.catch(() => undefined).then(() => withTenant(tenant, async () => {
@@ -2609,6 +2679,18 @@ async function runOpenAiAuthRequest<T>(task: K12Task | undefined, label: string,
         return result;
       } catch (error) {
         lastError = error;
+        if (options.restartOnInvalidState && isInvalidAuthStateError(error)) {
+          tenantState().openAiAuthCircuit = {
+            ...tenantState().openAiAuthCircuit,
+            nextAvailableAt: new Date(Date.now() + OPENAI_AUTH_MIN_INTERVAL_MS).toISOString(),
+            updatedAt: nowIso(),
+          };
+          if (task) {
+            appendLog(task, "warn", `OpenAI auth ${label} state 已失效，丢弃当前浏览器会话后重试`);
+            await persistTasks().catch(() => undefined);
+          }
+          throw error;
+        }
         recordOpenAiAuthFailure(error, task);
         if (task) await persistTasks().catch(() => undefined);
         if (isOpenAiUnsupportedCountryError(error) || !isOpenAiAuthTransientError(error) || attempt >= OPENAI_AUTH_MAX_ATTEMPTS) {
@@ -3194,13 +3276,12 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
   appendLog(task, "info", `登录 ChatGPT Web session: ${emailAddress}`);
   await ensureChatGptCsrfCookie(client);
   try {
-    await runOpenAiAuthRequest(task, "ChatGPTWebLogin", () => client.authLoginChatGPTWeb());
+    await runOpenAiAuthRequest(task, "ChatGPTWebLogin", () => client.authLoginChatGPTWeb(), {restartOnInvalidState: true});
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (isInvalidAuthStateError(error)) {
-      appendLog(task, "warn", "登录 auth session 已失效，重新打开 ChatGPT auth 入口后接管流程");
-      const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
-      await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
+      appendLog(task, "warn", "登录 auth session 已失效，当前浏览器会话作废");
+      throw error;
     } else if (isInvalidPasswordError(error)) {
       appendLog(task, "warn", "登录流程进入密码验证失败；按配置改走邮箱验证码登录");
       await continueAuthSteps(client, `${AUTH_BASE_URL}/log-in/password`, task, {finishChatGptCallback: true});
@@ -3228,13 +3309,11 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
         }),
       });
       try {
-        await runOpenAiAuthRequest(task, "ChatGPTWebLoginRetry", () => client.authLoginChatGPTWeb());
+        await runOpenAiAuthRequest(task, "ChatGPTWebLoginRetry", () => client.authLoginChatGPTWeb(), {restartOnInvalidState: true});
       } catch (retryError) {
         if (isInvalidAuthStateError(retryError)) {
-          appendLog(task, "warn", "重试后 auth session 仍失效，重新打开 ChatGPT auth 入口后接管流程");
-          const nextUrl = await openChatGptAuthEntryForWorkspaceSwitch(client, task);
-          await continueAuthSteps(client, nextUrl, task, {finishChatGptCallback: true});
-          return String(await client.getChatGPTAccessToken());
+          appendLog(task, "warn", "重试后 auth session 仍失效，当前浏览器会话作废");
+          throw retryError;
         }
         if (isEmailOtpSendStepError(retryError)) {
           appendLog(task, "warn", "重试后进入邮箱验证码流程，开始邮件接码");
@@ -3260,6 +3339,27 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
   }
   appendLog(task, "info", "读取 https://chatgpt.com/api/auth/session accessToken");
   return String(await client.getChatGPTAccessToken());
+}
+
+async function loginChatGptWebWithFreshSession(task: K12Task, email: EmailRecord): Promise<{client: any; accessToken: string}> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    assertNotCanceled(task);
+    let client = await createOpenAIClientForEmail(task, email);
+    try {
+      if (attempt > 1) {
+        appendLog(task, "warn", `重新创建浏览器会话后登录 (${attempt}/3)`);
+      }
+      const accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+      return {client, accessToken};
+    } catch (error) {
+      lastError = error;
+      if (!isInvalidAuthStateError(error) || attempt >= 3) throw error;
+      appendLog(task, "warn", "OpenAI 返回 invalid_state，当前登录会话作废，准备重新打开全新会话");
+      await sleepForTask(task, OPENAI_AUTH_MIN_INTERVAL_MS * attempt);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError || "ChatGPT web login failed"));
 }
 
 function extractAccessTokenFromCredentials(credentials: Record<string, unknown>): string {
@@ -4717,6 +4817,7 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
   if (tenantState().sub2apiRefillRunning) {
     throw new Error("Sub2API 补号检测正在运行，请稍后再试");
   }
+  assertTenantProxyConfigured();
   tenantState().sub2apiRefillRunning = true;
   tenantState().sub2apiRefillLastCheckedAt = nowIso();
   tenantState().sub2apiRefillLastError = "";
@@ -4855,6 +4956,7 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
 }
 
 async function testOpenAiAccessToken(accessToken: string, model = DEFAULT_AT_LIVENESS_MODEL): Promise<{ok: boolean; status: number; message: string; latencyMs: number; banned?: boolean}> {
+  assertTenantProxyConfigured();
   const tokenInfo = summarizeToken(accessToken);
   const startedAt = Date.now();
   const controller = new AbortController();
@@ -5440,6 +5542,7 @@ async function getAuthSessionCandidates(client: any): Promise<Record<string, unk
 }
 
 async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Promise<any> {
+  const proxy = assertTenantProxyConfigured();
   await ensureSentinelSdk();
   const {OpenAIClient, generateRandomDeviceProfile, MailboxUrlCodeProvider} = await loadBundleModules();
   let baseline: unknown = null;
@@ -5484,6 +5587,8 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
   return new OpenAIClient({
     email: email.email,
     password: tenantState().appConfig.defaultPassword,
+    proxyUrl: proxy.raw,
+    openaiFetchTimeoutMs: tenantState().appConfig.openaiFetchTimeoutMs,
     deviceProfile: generateRandomDeviceProfile(),
     signupScreenHint: "signup",
     bindEmail: email.email,
@@ -5945,10 +6050,12 @@ async function runTask(task: K12Task): Promise<void> {
 
   try {
     await runTaskStep(task, "prepare", async () => {
+      const proxy = assertTenantProxyConfigured();
+      appendLog(task, "info", `OpenAI 代理已启用: ${maskProxyForLog(proxy.raw)}`);
       await ensureSentinelSdk();
     });
 
-    const client = await createOpenAIClientForEmail(task, email);
+    let client = await createOpenAIClientForEmail(task, email);
     const useNoRtMode = task.sub2apiNoRtMode === true;
 
     let accessToken = "";
@@ -5956,9 +6063,10 @@ async function runTask(task: K12Task): Promise<void> {
     let jsonSource = "gpt-k12";
     if (task.runWorkspaceJoin) {
       accessToken = await runTaskStep(task, "login", async () => {
-        const token = await loginChatGptWebAndGetAccessToken(client, task, email.email);
-        recordAccessToken(task, email, token);
-        return token;
+        const login = await loginChatGptWebWithFreshSession(task, email);
+        client = login.client;
+        recordAccessToken(task, email, login.accessToken);
+        return login.accessToken;
       });
     }
 
@@ -5971,9 +6079,10 @@ async function runTask(task: K12Task): Promise<void> {
         appendLog(task, "info", "Sub2API noRT 模式已开启：跳过 OAuth，先加入/切换 K12，再用 K12 AT 入库");
         if (!accessToken) {
           accessToken = await runTaskStep(task, "login", async () => {
-            const token = await loginChatGptWebAndGetAccessToken(client, task, email.email);
-            recordAccessToken(task, email, token);
-            return token;
+            const login = await loginChatGptWebWithFreshSession(task, email);
+            client = login.client;
+            recordAccessToken(task, email, login.accessToken);
+            return login.accessToken;
           });
         }
         accessToken = await runTaskStep(task, "workspace_join", () => runK12WorkspaceJoin(client, task, email, accessToken));
@@ -6037,7 +6146,9 @@ async function runTask(task: K12Task): Promise<void> {
             if (!isAddPhoneFlowError(error)) throw error;
             appendLog(task, "warn", "Sub2API OA 授权触发 add-phone，尝试使用 K12 Web AT 创建 noRT 账号");
             if (!accessToken) {
-              accessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+              const login = await loginChatGptWebWithFreshSession(task, email);
+              client = login.client;
+              accessToken = login.accessToken;
               recordAccessToken(task, email, accessToken);
             }
             accessToken = await ensureK12AccessTokenForNoRt(client, task, accessToken);
@@ -6137,14 +6248,17 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
   await Promise.all([persistTasks(), persistEmails()]);
 
   try {
+    const proxy = assertTenantProxyConfigured();
+    appendLog(task, "info", `OpenAI 代理已启用: ${maskProxyForLog(proxy.raw)}`);
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
     const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
     appendLog(task, "info", `按名称查找 Sub2API 账号: ${names.join(" / ")}`);
     const account = await findSub2ApiAccountByName(origin, adminToken, names);
     if (!account) {
       appendLog(task, "warn", `Sub2API 未找到账号，改为重新获取 K12 AT 后新增账号: ${names.join(" / ")}`);
-      const client = await createOpenAIClientForEmail(task, email);
-      let newAccessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+      const login = await loginChatGptWebWithFreshSession(task, email);
+      const client = login.client;
+      let newAccessToken = login.accessToken;
       newAccessToken = await ensureK12AccessTokenForNoRt(client, task, newAccessToken);
       recordAccessToken(task, email, newAccessToken);
       await appendTokenOut(newAccessToken);
@@ -6207,8 +6321,9 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     }
 
     appendLog(task, "warn", "AT 不可用，开始重新登录获取新 K12 AT");
-    const client = await createOpenAIClientForEmail(task, email);
-    let newAccessToken = await loginChatGptWebAndGetAccessToken(client, task, email.email);
+    const login = await loginChatGptWebWithFreshSession(task, email);
+    const client = login.client;
+    let newAccessToken = login.accessToken;
     newAccessToken = await ensureK12AccessTokenForNoRt(client, task, newAccessToken);
     recordAccessToken(task, email, newAccessToken);
     await appendTokenOut(newAccessToken);
@@ -6334,6 +6449,7 @@ function enqueueK12Task(
 }
 
 async function createTasks(body: Record<string, unknown>): Promise<{created: K12Task[]; skippedRunning: number; missing: number}> {
+  assertTenantProxyConfigured();
   const requestedEmailIds = Array.isArray(body.emailIds)
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
     : [];
@@ -6389,6 +6505,7 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
 }
 
 function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]; skippedRunning: number; missing: number; skippedNoAccount: number} {
+  assertTenantProxyConfigured();
   const requestedEmailIds = Array.isArray(body.emailIds)
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
     : [];
@@ -6439,6 +6556,7 @@ function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]
 }
 
 function retryTask(source: K12Task): K12Task {
+  assertTenantProxyConfigured();
   if (!["failed", "canceled"].includes(source.status)) {
     throw new Error("只能重试失败或已取消的任务");
   }
@@ -6753,6 +6871,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       sub2apiPassword: asString(body.sub2apiPassword) || tenantState().appConfig.sub2apiPassword,
       smsBowerApiKey: asString(body.smsBowerApiKey) || tenantState().appConfig.smsBowerApiKey,
     });
+    const proxyRaw = asString(merged.defaultProxyUrl);
+    if (proxyRaw) {
+      const proxy = parseRequiredProxyConfig(proxyRaw);
+      if (!proxy) {
+        sendJson(res, 409, {error: requiredProxyConfigError()});
+        return;
+      }
+      merged.defaultProxyUrl = proxy.raw;
+    } else {
+      merged.defaultProxyUrl = "";
+    }
     await saveConfig(merged);
     sendJson(res, 200, {config: publicConfig()});
     return;
@@ -6833,30 +6962,38 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (method === "POST" && pathname === "/api/tasks") {
-    const body = await readJsonBody(req);
-    if (body.concurrency !== undefined) {
-      await saveConfig(normalizeConfig({...tenantState().appConfig, taskConcurrency: asNumber(body.concurrency, tenantState().appConfig.taskConcurrency, 1, 10)}));
+    try {
+      const body = await readJsonBody(req);
+      if (body.concurrency !== undefined) {
+        await saveConfig(normalizeConfig({...tenantState().appConfig, taskConcurrency: asNumber(body.concurrency, tenantState().appConfig.taskConcurrency, 1, 10)}));
+      }
+      const result = await createTasks(body);
+      sendJson(res, 201, {
+        tasks: result.created.map(publicTask),
+        skippedRunning: result.skippedRunning,
+        missing: result.missing,
+        smsBowerMailEnabled: tenantState().appConfig.smsBowerMailEnabled,
+        gmailMailProvider: tenantState().appConfig.gmailMailProvider,
+      });
+    } catch (error) {
+      sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
     }
-    const result = await createTasks(body);
-    sendJson(res, 201, {
-      tasks: result.created.map(publicTask),
-      skippedRunning: result.skippedRunning,
-      missing: result.missing,
-      smsBowerMailEnabled: tenantState().appConfig.smsBowerMailEnabled,
-      gmailMailProvider: tenantState().appConfig.gmailMailProvider,
-    });
     return;
   }
 
   if (method === "POST" && pathname === "/api/tasks/repair-at") {
-    const body = await readJsonBody(req);
-    const result = createAtRepairTasks(body);
-    sendJson(res, 201, {
-      tasks: result.created.map(publicTask),
-      skippedRunning: result.skippedRunning,
-      missing: result.missing,
-      skippedNoAccount: result.skippedNoAccount,
-    });
+    try {
+      const body = await readJsonBody(req);
+      const result = createAtRepairTasks(body);
+      sendJson(res, 201, {
+        tasks: result.created.map(publicTask),
+        skippedRunning: result.skippedRunning,
+        missing: result.missing,
+        skippedNoAccount: result.skippedNoAccount,
+      });
+    } catch (error) {
+      sendJson(res, 409, {error: error instanceof Error ? error.message : String(error)});
+    }
     return;
   }
 
@@ -6974,7 +7111,9 @@ async function boot(): Promise<void> {
   await mkdir(tenantsDir, {recursive: true});
   const defaultTenant = await getTenantRuntime("default");
   currentTenant = defaultTenant;
-  await ensureSentinelSdk();
+  if (parseRequiredProxyConfig(defaultTenant.appConfig.defaultProxyUrl)) {
+    await ensureSentinelSdk();
+  }
   createServer((req, res) => {
     void handler(req, res);
   }).listen(defaultTenant.appConfig.port, "0.0.0.0", () => {

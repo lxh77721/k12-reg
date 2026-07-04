@@ -273,8 +273,11 @@
                 </label>
               </div>
               <label class="field">
-                <span>默认 OpenAI 代理</span>
-                <input v-model="form.defaultProxyUrl" placeholder="direct 或 http://127.0.0.1:7897" />
+                <span>OpenAI 代理（必填）</span>
+                <input v-model.trim="form.defaultProxyUrl" placeholder="username:password@hostname:port" />
+                <small :class="{invalid: form.defaultProxyUrl && !proxyConfigValid}">
+                  每个浏览器/租户必须单独配置；格式必须是 username:password@hostname:port。
+                </small>
               </label>
             </section>
 
@@ -1086,13 +1089,43 @@ const form = reactive({
   jsonOutFormat: "sub2api",
 });
 
+function isRequiredProxyConfig(value: string): boolean {
+  const raw = String(value || "").trim();
+  if (!raw || raw.toLowerCase() === "direct" || /^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return false;
+  if (/[\s/?#]/.test(raw)) return false;
+  const atIndex = raw.indexOf("@");
+  if (atIndex <= 0 || atIndex !== raw.lastIndexOf("@")) return false;
+  const auth = raw.slice(0, atIndex);
+  const hostPort = raw.slice(atIndex + 1);
+  const passwordSeparator = auth.indexOf(":");
+  const portSeparator = hostPort.lastIndexOf(":");
+  if (passwordSeparator <= 0 || passwordSeparator === auth.length - 1 || portSeparator <= 0 || portSeparator === hostPort.length - 1) return false;
+  const username = auth.slice(0, passwordSeparator);
+  const password = auth.slice(passwordSeparator + 1);
+  const host = hostPort.slice(0, portSeparator);
+  const port = hostPort.slice(portSeparator + 1);
+  const portNumber = Number(port);
+  return Boolean(
+    username
+    && password
+    && host
+    && !/[:@]/.test(host)
+    && /^\d{1,5}$/.test(port)
+    && Number.isInteger(portNumber)
+    && portNumber >= 1
+    && portNumber <= 65535,
+  );
+}
+
 const busy = computed(() => summary.tasks.running > 0 || summary.tasks.queued > 0);
 const workspaceCount = computed(() => parseWorkspaceIds(workspaceText.value).length);
 const launchTaskCount = computed(() => {
   const count = Math.max(1, Number(runCount.value) || 1);
   return form.smsBowerMailEnabled ? count : Math.min(count, emails.value.filter((item) => item.status === "free").length);
 });
-const startTasksDisabled = computed(() => busy.value || (!form.smsBowerMailEnabled && launchTaskCount.value <= 0));
+const proxyConfigValid = computed(() => isRequiredProxyConfig(form.defaultProxyUrl));
+const proxyConfigError = "请先配置 OpenAI 代理，格式 username:password@hostname:port";
+const startTasksDisabled = computed(() => busy.value || !proxyConfigValid.value || (!form.smsBowerMailEnabled && launchTaskCount.value <= 0));
 const selectedRunnableEmailIds = computed(() => emails.value
   .filter((item) => selectedEmailIds.value.includes(item.id) && item.status !== "running" && item.status !== "banned")
   .map((item) => item.id));
@@ -1792,6 +1825,10 @@ async function repairSelectedTasks() {
     showToast("请选择任务");
     return;
   }
+  if (!proxyConfigValid.value) {
+    showToast(proxyConfigError);
+    return;
+  }
   try {
     const emailIds = Array.from(new Set(tasks.value
       .filter((task) => selectedTaskIds.value.includes(task.id))
@@ -1867,6 +1904,10 @@ async function checkTaskAccessToken(task: TaskItem) {
 }
 
 async function retryTask(id: string) {
+  if (!proxyConfigValid.value) {
+    showToast(proxyConfigError);
+    return;
+  }
   const data = await api<any>(`/api/tasks/${encodeURIComponent(id)}/retry`, {method: "POST", body: "{}"});
   if (data.task) {
     selectedTask.value = data.task;

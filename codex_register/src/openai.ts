@@ -5,7 +5,7 @@ import {stdin as input, stdout as output} from "node:process";
 import tls from "node:tls";
 import {URLSearchParams} from "node:url";
 import path from "node:path";
-import {Agent, ProxyAgent, setGlobalDispatcher, type Dispatcher} from "undici";
+import {Agent, ProxyAgent, type Dispatcher} from "undici";
 import {SocksClient} from "socks";
 import makeFetchCookie from "fetch-cookie";
 import {CookieJar} from "tough-cookie";
@@ -39,18 +39,50 @@ const FETCH_RETRY_DELAY_MS = 1500;
 const DEFAULT_FETCH_TIMEOUT_MS = 45000;
 const AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS = [8000, 15000, 30000];
 
-function resolveProxyUrl(): string {
-    for (const key of ["OPENAI_PROXY_URL", "DEFAULT_PROXY_URL"]) {
-        if (process.env[key] !== undefined) {
-            const value = String(process.env[key] ?? "").trim();
-            return value.toLowerCase() === "direct" ? "" : value;
-        }
+function proxyUrlForDispatcher(value: unknown): string {
+    const raw = String(value ?? "").trim();
+    if (!raw || raw.toLowerCase() === "direct") return "";
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
+    if (/[\s/?#]/.test(raw)) return raw;
+    const atIndex = raw.indexOf("@");
+    if (atIndex <= 0 || atIndex !== raw.lastIndexOf("@")) return raw;
+    const auth = raw.slice(0, atIndex);
+    const hostPort = raw.slice(atIndex + 1);
+    const passwordSeparator = auth.indexOf(":");
+    const portSeparator = hostPort.lastIndexOf(":");
+    if (passwordSeparator <= 0 || passwordSeparator === auth.length - 1 || portSeparator <= 0 || portSeparator === hostPort.length - 1) return raw;
+    const username = auth.slice(0, passwordSeparator);
+    const password = auth.slice(passwordSeparator + 1);
+    const host = hostPort.slice(0, portSeparator);
+    const port = hostPort.slice(portSeparator + 1);
+    const portNumber = Number(port);
+    if (!username || !password || !host || /[:@]/.test(host) || !/^\d{1,5}$/.test(port)) return raw;
+    if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return raw;
+    try {
+        const url = new URL(`http://${host}:${port}`);
+        url.username = username;
+        url.password = password;
+        return url.toString();
+    } catch {
+        return raw;
     }
-    const configured = (appConfig.defaultProxyUrl || "").trim();
-    return configured.toLowerCase() === "direct" ? "" : configured;
 }
 
-function resolveFetchTimeoutMs(): number {
+function resolveProxyUrl(value?: unknown): string {
+    if (value !== undefined) return proxyUrlForDispatcher(value);
+    for (const key of ["OPENAI_PROXY_URL", "DEFAULT_PROXY_URL"]) {
+        if (process.env[key] !== undefined) {
+            return proxyUrlForDispatcher(process.env[key]);
+        }
+    }
+    return proxyUrlForDispatcher(appConfig.defaultProxyUrl);
+}
+
+function resolveFetchTimeoutMs(value?: unknown): number {
+    const explicit = Number(value ?? "");
+    if (Number.isFinite(explicit) && explicit > 0) {
+        return Math.max(5000, Math.min(300000, Math.floor(explicit)));
+    }
     const parsed = Number(process.env.OPENAI_FETCH_TIMEOUT_MS || "");
     if (Number.isFinite(parsed) && parsed > 0) {
         return Math.max(5000, Math.min(300000, Math.floor(parsed)));
@@ -232,6 +264,8 @@ export interface SavedAuthRecord {
 export interface OpenAIClientOptions {
     email?: string;
     password: string;
+    proxyUrl?: string;
+    openaiFetchTimeoutMs?: number;
     userAgent?: string;
     deviceProfile?: DeviceProfile;
     manualMode?: boolean;
@@ -256,6 +290,8 @@ export class OpenAIClient {
     readonly deviceProfile: DeviceProfile;
     readonly clientHints: ReturnType<typeof getDeviceClientHints>;
     readonly signupScreenHint: string;
+    readonly dispatcher: Dispatcher;
+    readonly fetchTimeoutMs: number;
     state = "";
     codeVerifier = "";
     deviceID = "";
@@ -287,9 +323,10 @@ export class OpenAIClient {
         this.manualMode = options.manualMode ?? !this.email;
         this.signupScreenHint = options.signupScreenHint?.trim() || "signup";
         this.jar = new CookieJar();
-        const proxyUrl = resolveProxyUrl();
-        console.log(`[openai] proxy=${maskProxyForLog(proxyUrl)} timeout=${resolveFetchTimeoutMs()}ms`);
-        setGlobalDispatcher(createDispatcher(proxyUrl, shouldAllowInsecureTLS()));
+        const proxyUrl = resolveProxyUrl(options.proxyUrl);
+        this.fetchTimeoutMs = resolveFetchTimeoutMs(options.openaiFetchTimeoutMs);
+        console.log(`[openai] proxy=${maskProxyForLog(proxyUrl)} timeout=${this.fetchTimeoutMs}ms`);
+        this.dispatcher = createDispatcher(proxyUrl, shouldAllowInsecureTLS());
         const cookieFetch = makeFetchCookie(fetch, this.jar) as FetchLike;
         this.fetch = ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) =>
             this.fetchWithRetry(cookieFetch, input, init)) as FetchLike;
@@ -663,8 +700,8 @@ export class OpenAIClient {
 
         // Step 4: 提交密码
         if (continueURL === `${AUTH_BASE_URL}/log-in/password`) {
-            this.logProgress(step++, totalSteps, "密码页改走邮箱验证码");
-            continueURL = await this.sendEmailOtpForLogin();
+            this.logProgress(step++, totalSteps, "提交默认密码");
+            continueURL = await this.passwordVerify();
         }
 
         // 处理 email-verification（某些情况下登录也需要 OTP）
@@ -1950,7 +1987,7 @@ export class OpenAIClient {
         init?: Parameters<FetchLike>[1],
     ): Promise<Response> {
         let lastError: unknown;
-        const timeoutMs = resolveFetchTimeoutMs();
+        const timeoutMs = this.fetchTimeoutMs;
         const isAuthorizeContinue = this.isAuthorizeContinueRetryTarget(input);
         const maxAttempts = isAuthorizeContinue
             ? Math.max(FETCH_RETRY_COUNT, AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS.length + 1)
@@ -1958,7 +1995,10 @@ export class OpenAIClient {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             const timed = withFetchTimeout(init, timeoutMs);
             try {
-                const response = await baseFetch(input, timed.init);
+                const response = await baseFetch(input, {
+                    ...timed.init,
+                    dispatcher: this.dispatcher,
+                } as Parameters<FetchLike>[1]);
                 if (response.status === 429 && isAuthorizeContinue && attempt < maxAttempts) {
                     const delayMs = AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS[attempt - 1]
                         ?? AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS[AUTHORIZE_CONTINUE_RATE_LIMIT_DELAYS_MS.length - 1];

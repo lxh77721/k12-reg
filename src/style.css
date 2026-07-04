@@ -494,6 +494,10 @@ input[type="checkbox"] {
   line-height: 1.45;
 }
 
+.field > small.invalid {
+  color: #fecdd3;
+}
+
 .field-title-row {
   display: flex;
   align-items: center;
