@@ -46,13 +46,18 @@ function resolveProxyUrl(): string {
             return value.toLowerCase() === "direct" ? "" : value;
         }
     }
-    return (appConfig.defaultProxyUrl || "").trim();
+    const configured = (appConfig.defaultProxyUrl || "").trim();
+    return configured.toLowerCase() === "direct" ? "" : configured;
 }
 
 function resolveFetchTimeoutMs(): number {
     const parsed = Number(process.env.OPENAI_FETCH_TIMEOUT_MS || "");
-    if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_FETCH_TIMEOUT_MS;
-    return Math.max(5000, Math.min(300000, Math.floor(parsed)));
+    if (Number.isFinite(parsed) && parsed > 0) {
+        return Math.max(5000, Math.min(300000, Math.floor(parsed)));
+    }
+    const configured = Number(appConfig.openaiFetchTimeoutMs || 0);
+    if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_FETCH_TIMEOUT_MS;
+    return Math.max(5000, Math.min(300000, Math.floor(configured)));
 }
 
 function maskProxyForLog(value: string): string {

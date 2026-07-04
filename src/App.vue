@@ -863,6 +863,24 @@
 import {computed, onMounted, onUnmounted, reactive, ref, watch} from "vue";
 
 const QQ_STUDY_GROUP_IMAGE = "/qq-study-group.jpg";
+const TENANT_STORAGE_KEY = "k12-console-tenant-id";
+
+function createTenantId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `tenant_${crypto.randomUUID()}`;
+  }
+  return `tenant_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function getTenantId(): string {
+  const existing = localStorage.getItem(TENANT_STORAGE_KEY);
+  if (existing) return existing;
+  const created = createTenantId();
+  localStorage.setItem(TENANT_STORAGE_KEY, created);
+  return created;
+}
+
+const tenantId = getTenantId();
 
 interface EmailItem {
   id: string;
@@ -1137,6 +1155,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...options,
     headers: {
       "content-type": "application/json",
+      "x-k12-tenant-id": tenantId,
       ...(options.headers || {}),
     },
   });
@@ -1347,7 +1366,11 @@ async function refreshSmsBowerAccountQuietly() {
 
 async function exportData() {
   try {
-    const response = await fetch("/api/data/export");
+    const response = await fetch("/api/data/export", {
+      headers: {
+        "x-k12-tenant-id": tenantId,
+      },
+    });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       throw new Error(data.error || `HTTP ${response.status}`);

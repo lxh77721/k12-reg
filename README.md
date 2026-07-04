@@ -45,6 +45,15 @@ npm run dev
 npm run build
 ```
 
+## SaaS 多用户模式
+
+Web 控制台会在浏览器 `localStorage` 中生成一个租户 ID，并在所有 API 请求里通过 `X-K12-Tenant-Id` 传给后端。后端会按租户隔离配置、邮箱池、任务、补号历史和 JSON 输出：
+
+- 默认本地用户：`data/`
+- 线上浏览器租户：`data/tenants/<tenantId>/`
+
+因此线上部署后，每个用户可以保存自己的 Sub2API、代理、邮箱池等配置，不会共用同一份 `data/config.json`。如果用户清空浏览器数据或换浏览器，会生成新的租户空间。
+
 ## 基础使用
 
 1. 打开 Web 控制台。

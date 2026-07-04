@@ -1,4 +1,5 @@
-﻿import {createHash, randomInt, randomUUID} from "node:crypto";
+﻿import {AsyncLocalStorage} from "node:async_hooks";
+import {createHash, randomInt, randomUUID} from "node:crypto";
 import {existsSync} from "node:fs";
 import {mkdir, readFile, stat, writeFile} from "node:fs/promises";
 import {createServer, type IncomingMessage, type ServerResponse} from "node:http";
@@ -211,11 +212,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const dataDir = path.join(rootDir, "data");
-const configFile = path.join(dataDir, "config.json");
-const emailsFile = path.join(dataDir, "emails.json");
-const tasksFile = path.join(dataDir, "tasks.json");
-const sub2apiRefillHistoryFile = path.join(dataDir, "sub2api-refill-history.json");
-const compatConfigFile = path.join(rootDir, "config.json");
+const tenantsDir = path.join(dataDir, "tenants");
+const legacyConfigFile = path.join(dataDir, "config.json");
+const legacyEmailsFile = path.join(dataDir, "emails.json");
+const legacyTasksFile = path.join(dataDir, "tasks.json");
+const legacySub2apiRefillHistoryFile = path.join(dataDir, "sub2api-refill-history.json");
+const legacyCompatConfigFile = path.join(rootDir, "config.json");
 const defaultJsonOutDir = path.join(rootDir, "json");
 
 const DEFAULT_REFERENCE_BUNDLE = rootDir;
@@ -243,18 +245,35 @@ const SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.
 const SENTINEL_SDK_PATCH_HOOK = "t.init=we,t.sessionObserverToken=async function(t){";
 const sentinelSdkFile = path.join(rootDir, "sdk.js");
 
-let appConfig: AppConfig;
-let emails: EmailRecord[] = [];
-let tasks: K12Task[] = [];
-let sub2apiRefillHistory: Sub2ApiRefillHistoryEntry[] = [];
-let activeWorkers = 0;
-const manualOtpWaiters = new Map<string, {resolve: (code: string) => void; reject: (error: Error) => void; expiresAt: number}>();
-let sub2apiRefillTimer: ReturnType<typeof setInterval> | undefined;
-let sub2apiRefillRunning = false;
-let sub2apiRefillLastCheckedAt = "";
-let sub2apiRefillNextCheckAt = "";
-let sub2apiRefillLastError = "";
-let sub2apiRefillLastResult: Sub2ApiRefillResult | null = null;
+interface TenantRuntime {
+  id: string;
+  dir: string;
+  configFile: string;
+  emailsFile: string;
+  tasksFile: string;
+  sub2apiRefillHistoryFile: string;
+  compatConfigFile: string;
+  defaultJsonOutDir: string;
+  defaultTokenOut: string;
+  appConfig: AppConfig;
+  emails: EmailRecord[];
+  tasks: K12Task[];
+  sub2apiRefillHistory: Sub2ApiRefillHistoryEntry[];
+  activeWorkers: number;
+  manualOtpWaiters: Map<string, {resolve: (code: string) => void; reject: (error: Error) => void; expiresAt: number}>;
+  sub2apiRefillTimer?: ReturnType<typeof setInterval>;
+  sub2apiRefillRunning: boolean;
+  sub2apiRefillLastCheckedAt: string;
+  sub2apiRefillNextCheckAt: string;
+  sub2apiRefillLastError: string;
+  sub2apiRefillLastResult: Sub2ApiRefillResult | null;
+  loaded: boolean;
+  loading?: Promise<TenantRuntime>;
+}
+
+const tenantStorage = new AsyncLocalStorage<TenantRuntime>();
+const tenants = new Map<string, TenantRuntime>();
+let currentTenant: TenantRuntime | undefined;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -407,8 +426,123 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function tenantState(): TenantRuntime {
+  const tenant = tenantStorage.getStore() || currentTenant;
+  if (!tenant) throw new Error("tenant context is not initialized");
+  return tenant;
+}
+
+async function withTenant<T>(tenant: TenantRuntime, fn: () => Promise<T> | T): Promise<T> {
+  return tenantStorage.run(tenant, async () => await fn());
+}
+
+function sanitizeTenantId(value: unknown): string {
+  const text = String(value || "").trim();
+  if (!text) return "default";
+  const normalized = text.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80);
+  return normalized || "default";
+}
+
+function resolveTenantOutputPath(configured: string, fallback: string): string {
+  const tenant = tenantState();
+  const raw = asString(configured);
+  if (tenant.id === "default") {
+    if (!raw) return fallback;
+    return path.isAbsolute(raw) ? raw : path.join(rootDir, raw);
+  }
+  if (!raw) return fallback;
+  const relative = path.isAbsolute(raw)
+    ? path.basename(raw)
+    : raw.replace(/^([/\\])+/, "");
+  const resolved = path.resolve(tenant.dir, relative);
+  const root = path.resolve(tenant.dir);
+  return resolved === root || resolved.startsWith(root + path.sep) ? resolved : fallback;
+}
+
+function tenantIdFromRequest(req: IncomingMessage): string {
+  const header = req.headers["x-k12-tenant-id"];
+  const raw = Array.isArray(header) ? header[0] : header;
+  return sanitizeTenantId(raw);
+}
+
+function createTenantRuntime(id: string): TenantRuntime {
+  const isDefault = id === "default";
+  const dir = isDefault ? dataDir : path.join(tenantsDir, id);
+  return {
+    id,
+    dir,
+    configFile: isDefault ? legacyConfigFile : path.join(dir, "config.json"),
+    emailsFile: isDefault ? legacyEmailsFile : path.join(dir, "emails.json"),
+    tasksFile: isDefault ? legacyTasksFile : path.join(dir, "tasks.json"),
+    sub2apiRefillHistoryFile: isDefault ? legacySub2apiRefillHistoryFile : path.join(dir, "sub2api-refill-history.json"),
+    compatConfigFile: isDefault ? legacyCompatConfigFile : path.join(dir, "config.json"),
+    defaultJsonOutDir: isDefault ? defaultJsonOutDir : path.join(dir, "json"),
+    defaultTokenOut: isDefault ? path.join(rootDir, "pool_tokens.txt") : path.join(dir, "pool_tokens.txt"),
+    appConfig: undefined as unknown as AppConfig,
+    emails: [],
+    tasks: [],
+    sub2apiRefillHistory: [],
+    activeWorkers: 0,
+    manualOtpWaiters: new Map(),
+    sub2apiRefillRunning: false,
+    sub2apiRefillLastCheckedAt: "",
+    sub2apiRefillNextCheckAt: "",
+    sub2apiRefillLastError: "",
+    sub2apiRefillLastResult: null,
+    loaded: false,
+  };
+}
+
+async function loadTenantRuntime(tenant: TenantRuntime): Promise<TenantRuntime> {
+  return withTenant(tenant, async () => {
+    await mkdir(tenant.dir, {recursive: true});
+    tenant.appConfig = await loadConfig();
+    await saveConfig(tenant.appConfig);
+    await ensureSentinelSdk();
+    tenant.emails = await readJson<EmailRecord[]>(tenant.emailsFile, []);
+    tenant.tasks = await readJson<K12Task[]>(tenant.tasksFile, []);
+    tenant.sub2apiRefillHistory = (await readJson<Sub2ApiRefillHistoryEntry[]>(tenant.sub2apiRefillHistoryFile, []))
+      .filter((item) => item && typeof item === "object" && asString(item.id) && asString(item.checkedAt))
+      .slice(0, 200);
+    for (const task of tenant.tasks) {
+      if (task.status === "running" || task.status === "queued") {
+        task.status = "failed";
+        task.error = "server restarted before task finished";
+        task.finishedAt = nowIso();
+        task.waitingOtp = false;
+        task.waitingOtpLabel = undefined;
+        task.waitingOtpEmail = undefined;
+        task.waitingOtpSince = undefined;
+        appendLog(task, "warn", "服务重启，未完成任务已标记失败");
+      }
+    }
+    await hydrateTaskAccessTokensFromTokenOut();
+    await persistTasks();
+    await reconcileAndPersistEmailStatuses();
+    tenant.loaded = true;
+    scheduleTasks();
+    return tenant;
+  });
+}
+
+async function getTenantRuntime(id: string): Promise<TenantRuntime> {
+  const tenantId = sanitizeTenantId(id);
+  let tenant = tenants.get(tenantId);
+  if (!tenant) {
+    tenant = createTenantRuntime(tenantId);
+    tenants.set(tenantId, tenant);
+  }
+  if (tenant.loaded) return tenant;
+  if (!tenant.loading) {
+    tenant.loading = loadTenantRuntime(tenant).finally(() => {
+      tenant.loading = undefined;
+    });
+  }
+  return tenant.loading;
+}
+
 function buildDownloadFetchOptions(): {dispatcher?: ProxyAgent} {
-  const proxyUrl = appConfig?.defaultProxyUrl || process.env.DEFAULT_PROXY_URL || process.env.OPENAI_PROXY_URL || "";
+  const proxyUrl = tenantState().appConfig?.defaultProxyUrl || process.env.DEFAULT_PROXY_URL || process.env.OPENAI_PROXY_URL || "";
   if (!proxyUrl || proxyUrl === "direct") return {};
   return {dispatcher: new ProxyAgent(proxyUrl)};
 }
@@ -449,7 +583,7 @@ async function readReferenceConfig(referenceBundlePath: string): Promise<Record<
 async function defaultConfig(): Promise<AppConfig> {
   const referenceBundlePath = DEFAULT_REFERENCE_BUNDLE;
   const ref = await readReferenceConfig(referenceBundlePath);
-  const tokenOut = path.join(rootDir, "pool_tokens.txt");
+  const tokenOut = tenantState().defaultTokenOut;
   return {
     port: asNumber(process.env.PORT, 8796, 1, 65535),
     referenceBundlePath,
@@ -491,14 +625,14 @@ async function defaultConfig(): Promise<AppConfig> {
     emailnatorEmailType: "plusGmail",
     requireChatgptAccountId: true,
     tokenOut,
-    jsonOutDir: defaultJsonOutDir,
+    jsonOutDir: tenantState().defaultJsonOutDir,
     jsonOutFormat: "sub2api",
   };
 }
 
 async function loadConfig(): Promise<AppConfig> {
   const base = await defaultConfig();
-  const saved = await readJson<Partial<AppConfig>>(configFile, {});
+  const saved = await readJson<Partial<AppConfig>>(tenantState().configFile, {});
   return normalizeConfig({...base, ...saved});
 }
 
@@ -547,59 +681,59 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     emailnatorBaseUrl: normalizeEmailnatorBaseUrl(raw.emailnatorBaseUrl),
     emailnatorEmailType: normalizeEmailnatorEmailType(raw.emailnatorEmailType),
     requireChatgptAccountId: asBoolean(raw.requireChatgptAccountId, true),
-    tokenOut: asString(raw.tokenOut) || path.join(rootDir, "pool_tokens.txt"),
-    jsonOutDir: asString(raw.jsonOutDir) || defaultJsonOutDir,
+    tokenOut: resolveTenantOutputPath(asString(raw.tokenOut), tenantState().defaultTokenOut),
+    jsonOutDir: resolveTenantOutputPath(asString(raw.jsonOutDir), tenantState().defaultJsonOutDir),
     jsonOutFormat: normalizeJsonOutFormat(raw.jsonOutFormat),
   };
 }
 
 async function saveConfig(next: AppConfig): Promise<void> {
-  appConfig = normalizeConfig(next);
-  await writeJson(configFile, appConfig);
+  tenantState().appConfig = normalizeConfig(next);
+  await writeJson(tenantState().configFile, tenantState().appConfig);
   await ensureCompatBundleConfig();
   configureSub2ApiRefillTimer();
 }
 
 async function ensureCompatBundleConfig(): Promise<void> {
-  const existing = await readJson<Record<string, unknown>>(compatConfigFile, {});
-  await writeJson(compatConfigFile, {
+  const existing = await readJson<Record<string, unknown>>(tenantState().compatConfigFile, {});
+  await writeJson(tenantState().compatConfigFile, {
     ...existing,
     provider: asString(existing.provider, "hotmail"),
-    defaultPassword: appConfig.defaultPassword,
-    defaultProxyUrl: appConfig.defaultProxyUrl,
-    mailApiBaseUrl: appConfig.mailApiBaseUrl,
-    sub2apiNoRtMode: appConfig.sub2apiNoRtMode,
-    sub2apiUrl: appConfig.sub2apiUrl,
-    sub2apiEmail: appConfig.sub2apiEmail,
-    sub2apiPassword: appConfig.sub2apiPassword,
-    sub2apiGroupName: primarySub2ApiGroupName(appConfig.sub2apiGroupName),
-    sub2apiGroupNames: parseSub2ApiGroupNames(appConfig.sub2apiGroupName),
-    sub2apiProxyName: appConfig.sub2apiProxyName,
-    sub2apiAccountPriority: appConfig.sub2apiAccountPriority,
-    sub2apiConcurrency: appConfig.sub2apiConcurrency,
-    sub2apiAutoRefillEnabled: appConfig.sub2apiAutoRefillEnabled,
-    sub2apiRefillGroupName: appConfig.sub2apiRefillGroupName,
-    sub2apiRefillThreshold: appConfig.sub2apiRefillThreshold,
-    sub2apiRefillEmailCount: appConfig.sub2apiRefillEmailCount,
-    sub2apiRefillIntervalMs: appConfig.sub2apiRefillIntervalMs,
-    sub2apiRefillDeepCheckEnabled: appConfig.sub2apiRefillDeepCheckEnabled,
-    gmailMailProvider: appConfig.gmailMailProvider,
-    smsBowerMailEnabled: appConfig.smsBowerMailEnabled,
-    smsBowerApiKey: appConfig.smsBowerApiKey,
-    smsBowerMailBaseUrl: appConfig.smsBowerMailBaseUrl,
-    smsBowerMailService: appConfig.smsBowerMailService,
-    smsBowerMailDomain: appConfig.smsBowerMailDomain,
-    smsBowerMailMaxPrice: appConfig.smsBowerMailMaxPrice,
-    smsBowerGmailFissionEnabled: appConfig.smsBowerGmailFissionEnabled,
-    smsBowerGmailFissionCount: appConfig.smsBowerGmailFissionCount,
-    emailnatorBaseUrl: appConfig.emailnatorBaseUrl,
-    emailnatorEmailType: appConfig.emailnatorEmailType,
-    jsonOutDir: appConfig.jsonOutDir,
-    jsonOutFormat: appConfig.jsonOutFormat,
+    defaultPassword: tenantState().appConfig.defaultPassword,
+    defaultProxyUrl: tenantState().appConfig.defaultProxyUrl,
+    mailApiBaseUrl: tenantState().appConfig.mailApiBaseUrl,
+    sub2apiNoRtMode: tenantState().appConfig.sub2apiNoRtMode,
+    sub2apiUrl: tenantState().appConfig.sub2apiUrl,
+    sub2apiEmail: tenantState().appConfig.sub2apiEmail,
+    sub2apiPassword: tenantState().appConfig.sub2apiPassword,
+    sub2apiGroupName: primarySub2ApiGroupName(tenantState().appConfig.sub2apiGroupName),
+    sub2apiGroupNames: parseSub2ApiGroupNames(tenantState().appConfig.sub2apiGroupName),
+    sub2apiProxyName: tenantState().appConfig.sub2apiProxyName,
+    sub2apiAccountPriority: tenantState().appConfig.sub2apiAccountPriority,
+    sub2apiConcurrency: tenantState().appConfig.sub2apiConcurrency,
+    sub2apiAutoRefillEnabled: tenantState().appConfig.sub2apiAutoRefillEnabled,
+    sub2apiRefillGroupName: tenantState().appConfig.sub2apiRefillGroupName,
+    sub2apiRefillThreshold: tenantState().appConfig.sub2apiRefillThreshold,
+    sub2apiRefillEmailCount: tenantState().appConfig.sub2apiRefillEmailCount,
+    sub2apiRefillIntervalMs: tenantState().appConfig.sub2apiRefillIntervalMs,
+    sub2apiRefillDeepCheckEnabled: tenantState().appConfig.sub2apiRefillDeepCheckEnabled,
+    gmailMailProvider: tenantState().appConfig.gmailMailProvider,
+    smsBowerMailEnabled: tenantState().appConfig.smsBowerMailEnabled,
+    smsBowerApiKey: tenantState().appConfig.smsBowerApiKey,
+    smsBowerMailBaseUrl: tenantState().appConfig.smsBowerMailBaseUrl,
+    smsBowerMailService: tenantState().appConfig.smsBowerMailService,
+    smsBowerMailDomain: tenantState().appConfig.smsBowerMailDomain,
+    smsBowerMailMaxPrice: tenantState().appConfig.smsBowerMailMaxPrice,
+    smsBowerGmailFissionEnabled: tenantState().appConfig.smsBowerGmailFissionEnabled,
+    smsBowerGmailFissionCount: tenantState().appConfig.smsBowerGmailFissionCount,
+    emailnatorBaseUrl: tenantState().appConfig.emailnatorBaseUrl,
+    emailnatorEmailType: tenantState().appConfig.emailnatorEmailType,
+    jsonOutDir: tenantState().appConfig.jsonOutDir,
+    jsonOutFormat: tenantState().appConfig.jsonOutFormat,
   });
 }
 
-function publicConfig(config = appConfig): Record<string, unknown> {
+function publicConfig(config = tenantState().appConfig): Record<string, unknown> {
   return {
     ...config,
     defaultPassword: "",
@@ -632,7 +766,7 @@ function buildMicrosoftMailboxUrl(baseUrl: string, email: string, clientId: stri
   return url.toString();
 }
 
-function parseEmailLine(line: string, config = appConfig): ParsedEmailLine | null {
+function parseEmailLine(line: string, config = tenantState().appConfig): ParsedEmailLine | null {
   const raw = line.trim();
   if (!raw || raw.startsWith("#")) return null;
   const parts = raw.split(/\s*-{4,}\s*|\t|,/).map((item) => item.trim()).filter(Boolean);
@@ -659,7 +793,7 @@ function parseEmailLine(line: string, config = appConfig): ParsedEmailLine | nul
   return {email, password, mailboxUrl, clientId, refreshToken, raw};
 }
 
-function parseManualEmailLine(line: string, config = appConfig): ParsedEmailLine | null {
+function parseManualEmailLine(line: string, config = tenantState().appConfig): ParsedEmailLine | null {
   const raw = line.trim();
   if (!raw || raw.startsWith("#")) return null;
   const match = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
@@ -729,9 +863,9 @@ function smsBowerMailServiceCode(value: unknown): string {
 }
 
 function buildSmsBowerMailUrl(action: string, params: Record<string, string | number | undefined> = {}): URL {
-  const base = normalizeSmsBowerMailBaseUrl(appConfig.smsBowerMailBaseUrl);
+  const base = normalizeSmsBowerMailBaseUrl(tenantState().appConfig.smsBowerMailBaseUrl);
   const url = new URL(`${base}/${smsBowerMailActionPath(action)}`);
-  url.searchParams.set("api_key", appConfig.smsBowerApiKey);
+  url.searchParams.set("api_key", tenantState().appConfig.smsBowerApiKey);
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === "") continue;
     url.searchParams.set(key, String(value));
@@ -741,7 +875,7 @@ function buildSmsBowerMailUrl(action: string, params: Record<string, string | nu
 
 function buildSmsBowerHandlerUrl(action: string, params: Record<string, string | number | undefined> = {}): URL {
   const url = new URL(DEFAULT_SMSBOWER_HANDLER_URL);
-  url.searchParams.set("api_key", appConfig.smsBowerApiKey);
+  url.searchParams.set("api_key", tenantState().appConfig.smsBowerApiKey);
   url.searchParams.set("action", action);
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === "") continue;
@@ -751,7 +885,7 @@ function buildSmsBowerHandlerUrl(action: string, params: Record<string, string |
 }
 
 async function requestSmsBowerMail(action: string, params: Record<string, string | number | undefined> = {}): Promise<unknown> {
-  if (!appConfig.smsBowerApiKey) throw new Error("SMSBower API Key 未配置");
+  if (!tenantState().appConfig.smsBowerApiKey) throw new Error("SMSBower API Key 未配置");
   const url = buildSmsBowerMailUrl(action, params);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
@@ -786,7 +920,7 @@ async function requestSmsBowerMail(action: string, params: Record<string, string
 }
 
 async function requestSmsBowerHandler(action: string, params: Record<string, string | number | undefined> = {}): Promise<unknown> {
-  if (!appConfig.smsBowerApiKey) throw new Error("SMSBower API Key 未配置");
+  if (!tenantState().appConfig.smsBowerApiKey) throw new Error("SMSBower API Key 未配置");
   const url = buildSmsBowerHandlerUrl(action, params);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
@@ -1010,11 +1144,11 @@ function extractSmsBowerCodeArrivalMs(payload: unknown): number | undefined {
 }
 
 async function getSmsBowerAccountSnapshot(): Promise<SmsBowerAccountSnapshot> {
-  const apiKeyPresent = Boolean(appConfig.smsBowerApiKey);
+  const apiKeyPresent = Boolean(tenantState().appConfig.smsBowerApiKey);
   const base = {
-    enabled: appConfig.smsBowerMailEnabled,
+    enabled: tenantState().appConfig.smsBowerMailEnabled,
     apiKeyPresent,
-    apiKeyMasked: maskSecret(appConfig.smsBowerApiKey, 4, 4),
+    apiKeyMasked: maskSecret(tenantState().appConfig.smsBowerApiKey, 4, 4),
     currency: "USD",
     ...smsBowerLocalSpendSummary(),
     fetchedAt: nowIso(),
@@ -1037,7 +1171,7 @@ async function getSmsBowerAccountSnapshot(): Promise<SmsBowerAccountSnapshot> {
 
 function smsBowerLocalSpendSummary(): {localSpend: number; rentedCount: number; closedCount: number} {
   const roots = new Map<string, EmailRecord>();
-  for (const email of emails) {
+  for (const email of tenantState().emails) {
     if (!email.smsBowerMailId) continue;
     if (!roots.has(email.smsBowerMailId)) roots.set(email.smsBowerMailId, email);
   }
@@ -1055,14 +1189,14 @@ function smsBowerLocalSpendSummary(): {localSpend: number; rentedCount: number; 
 }
 
 async function rentSmsBowerMail(): Promise<{id: string; email: string; cost?: number}> {
-  const serviceCode = smsBowerMailServiceCode(appConfig.smsBowerMailService);
+  const serviceCode = smsBowerMailServiceCode(tenantState().appConfig.smsBowerMailService);
   const params: Record<string, string | number | undefined> = {
     service: serviceCode,
-    domain: appConfig.smsBowerMailDomain,
+    domain: tenantState().appConfig.smsBowerMailDomain,
   };
-  if (appConfig.smsBowerMailMaxPrice) {
-    params.maxPrice = appConfig.smsBowerMailMaxPrice;
-    params.max_price = appConfig.smsBowerMailMaxPrice;
+  if (tenantState().appConfig.smsBowerMailMaxPrice) {
+    params.maxPrice = tenantState().appConfig.smsBowerMailMaxPrice;
+    params.max_price = tenantState().appConfig.smsBowerMailMaxPrice;
   }
   const payload = await requestSmsBowerMail("getActivation", params);
   return {...parseSmsBowerActivation(payload), cost: extractSmsBowerCost(payload)};
@@ -1076,7 +1210,7 @@ function gmailAlias(rootEmail: string): string {
 
 async function createSmsBowerMailRecords(count: number): Promise<EmailRecord[]> {
   const created: EmailRecord[] = [];
-  const childrenPerRoot = appConfig.smsBowerGmailFissionEnabled ? Math.max(0, appConfig.smsBowerGmailFissionCount) : 0;
+  const childrenPerRoot = tenantState().appConfig.smsBowerGmailFissionEnabled ? Math.max(0, tenantState().appConfig.smsBowerGmailFissionCount) : 0;
   while (created.length < count) {
     const rented = await rentSmsBowerMail();
     const root = rented.email.toLowerCase();
@@ -1084,7 +1218,7 @@ async function createSmsBowerMailRecords(count: number): Promise<EmailRecord[]> 
       id: `smsbower_${Date.now()}_${randomUUID().slice(0, 8)}`,
       email: root,
       otpMode: "smsbower-mail",
-      password: appConfig.defaultPassword,
+      password: tenantState().appConfig.defaultPassword,
       mailboxUrl: "",
       raw: `smsbower-mail:${rented.id}:${root}`,
       status: "free",
@@ -1095,7 +1229,7 @@ async function createSmsBowerMailRecords(count: number): Promise<EmailRecord[]> 
       smsBowerMailCost: rented.cost,
       smsBowerFissionChildrenRemaining: childrenPerRoot,
     };
-    emails.push(record);
+    tenantState().emails.push(record);
     created.push(record);
   }
   await persistEmails();
@@ -1122,7 +1256,7 @@ function readCookieValue(cookie: string, name: string): string {
 }
 
 function emailnatorHeaders(record: Pick<EmailRecord, "emailnatorSessionCookie" | "emailnatorXsrfToken" | "emailnatorBaseUrl">, refererPath = "/"): Record<string, string> {
-  const baseUrl = normalizeEmailnatorBaseUrl(record.emailnatorBaseUrl || appConfig.emailnatorBaseUrl);
+  const baseUrl = normalizeEmailnatorBaseUrl(record.emailnatorBaseUrl || tenantState().appConfig.emailnatorBaseUrl);
   return {
     Accept: "application/json, text/plain, */*",
     "Accept-Language": "zh-CN,zh;q=0.9",
@@ -1145,7 +1279,7 @@ function emailnatorHeaders(record: Pick<EmailRecord, "emailnatorSessionCookie" |
 }
 
 async function createEmailnatorSession(): Promise<{baseUrl: string; cookie: string; xsrfToken: string}> {
-  const baseUrl = normalizeEmailnatorBaseUrl(appConfig.emailnatorBaseUrl);
+  const baseUrl = normalizeEmailnatorBaseUrl(tenantState().appConfig.emailnatorBaseUrl);
   const response = await undiciFetch(`${baseUrl}/`, {
     ...buildDownloadFetchOptions(),
     headers: {
@@ -1192,7 +1326,7 @@ async function rentEmailnatorMail(): Promise<{email: string; cookie: string; xsr
   const payload = await requestEmailnatorJson<Record<string, unknown>>(
     session,
     "/generate-email",
-    {email: [normalizeEmailnatorEmailType(appConfig.emailnatorEmailType)]},
+    {email: [normalizeEmailnatorEmailType(tenantState().appConfig.emailnatorEmailType)]},
   );
   const items = Array.isArray(payload?.email) ? payload.email.map((item) => String(item).trim()).filter(Boolean) : [];
   const email = items.find((item) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item)) || "";
@@ -1227,7 +1361,7 @@ async function createEmailnatorMailRecords(count: number): Promise<EmailRecord[]
       id: `emailnator_${Date.now()}_${randomUUID().slice(0, 8)}`,
       email: rented.email,
       otpMode: "emailnator",
-      password: appConfig.defaultPassword,
+      password: tenantState().appConfig.defaultPassword,
       mailboxUrl: "",
       raw: `emailnator:${rented.email}`,
       status: "free",
@@ -1240,7 +1374,7 @@ async function createEmailnatorMailRecords(count: number): Promise<EmailRecord[]
       emailnatorUsedMessageIds: [],
       emailnatorBaselineMessageIds: rented.baselineMessageIds,
     };
-    emails.push(record);
+    tenantState().emails.push(record);
     created.push(record);
   }
   await persistEmails();
@@ -1261,7 +1395,7 @@ async function requestEmailnatorForEmail<T>(email: EmailRecord, body: unknown): 
     await refreshEmailnatorSession(email);
   }
   const session = {
-    baseUrl: normalizeEmailnatorBaseUrl(email.emailnatorBaseUrl || appConfig.emailnatorBaseUrl),
+    baseUrl: normalizeEmailnatorBaseUrl(email.emailnatorBaseUrl || tenantState().appConfig.emailnatorBaseUrl),
     cookie: String(email.emailnatorSessionCookie || ""),
     xsrfToken: String(email.emailnatorXsrfToken || ""),
   };
@@ -1272,7 +1406,7 @@ async function requestEmailnatorForEmail<T>(email: EmailRecord, body: unknown): 
     if (!/419|401|403|csrf|xsrf|token|session/i.test(message)) throw error;
     await refreshEmailnatorSession(email);
     return requestEmailnatorJson<T>({
-      baseUrl: normalizeEmailnatorBaseUrl(email.emailnatorBaseUrl || appConfig.emailnatorBaseUrl),
+      baseUrl: normalizeEmailnatorBaseUrl(email.emailnatorBaseUrl || tenantState().appConfig.emailnatorBaseUrl),
       cookie: String(email.emailnatorSessionCookie || ""),
       xsrfToken: String(email.emailnatorXsrfToken || ""),
     }, "/message-list", body, `/mailbox/#${encodeURIComponent(email.email)}`);
@@ -1356,7 +1490,7 @@ async function waitForEmailnatorCode(email: EmailRecord, task: K12Task, label: s
 
 function createSmsBowerFissionChild(parent: EmailRecord): EmailRecord {
   const root = (parent.smsBowerMailRoot || rootMailboxIdentity(parent)).toLowerCase();
-  const existing = new Set(emails.map((item) => item.email.toLowerCase()));
+  const existing = new Set(tenantState().emails.map((item) => item.email.toLowerCase()));
   let address = "";
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const candidate = gmailAlias(root).toLowerCase();
@@ -1371,7 +1505,7 @@ function createSmsBowerFissionChild(parent: EmailRecord): EmailRecord {
     email: address,
     parentEmail: root,
     otpMode: "smsbower-mail",
-    password: parent.password || appConfig.defaultPassword,
+    password: parent.password || tenantState().appConfig.defaultPassword,
     mailboxUrl: "",
     raw: `smsbower-mail:${parent.smsBowerMailId}:${address}`,
     status: "free",
@@ -1382,7 +1516,7 @@ function createSmsBowerFissionChild(parent: EmailRecord): EmailRecord {
     smsBowerMailCost: parent.smsBowerMailCost,
     smsBowerFissionParentEmailId: parent.id,
   };
-  emails.push(record);
+  tenantState().emails.push(record);
   return record;
 }
 
@@ -1428,7 +1562,7 @@ async function waitForSmsBowerMailCode(email: EmailRecord, task: K12Task, label:
           await sleepForTask(task, 3000);
           continue;
         }
-        const related = emails.filter((item) => item.smsBowerMailId === id);
+        const related = tenantState().emails.filter((item) => item.smsBowerMailId === id);
         for (const item of related) {
           item.smsBowerMailUsedCodes = Array.from(new Set([...(item.smsBowerMailUsedCodes || []), code])).slice(-20);
           item.updatedAt = nowIso();
@@ -1472,7 +1606,7 @@ async function requestSmsBowerNextMailCode(email: EmailRecord, task?: K12Task, r
 
 async function finalizeSmsBowerMailIfDone(email: EmailRecord): Promise<void> {
   if (email.otpMode !== "smsbower-mail" || !email.smsBowerMailId) return;
-  const related = emails.filter((item) => item.smsBowerMailId === email.smsBowerMailId);
+  const related = tenantState().emails.filter((item) => item.smsBowerMailId === email.smsBowerMailId);
   const active = related.some((item) => hasActiveTask(item.id));
   if (active) return;
   const hasFailed = related.some((item) => item.status === "failed" || item.status === "banned");
@@ -1570,10 +1704,10 @@ function appendLog(task: K12Task, level: LogLevel, message: string): void {
 }
 
 async function waitForManualEmailOtp(task: K12Task, email: EmailRecord, label: string): Promise<string> {
-  const existing = manualOtpWaiters.get(task.id);
+  const existing = tenantState().manualOtpWaiters.get(task.id);
   if (existing) {
     existing.reject(new Error("新的验证码请求已覆盖旧请求"));
-    manualOtpWaiters.delete(task.id);
+    tenantState().manualOtpWaiters.delete(task.id);
   }
 
   task.waitingOtp = true;
@@ -1585,7 +1719,7 @@ async function waitForManualEmailOtp(task: K12Task, email: EmailRecord, label: s
 
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
-      manualOtpWaiters.delete(task.id);
+      tenantState().manualOtpWaiters.delete(task.id);
       task.waitingOtp = false;
       task.waitingOtpLabel = undefined;
       task.waitingOtpEmail = undefined;
@@ -1595,7 +1729,7 @@ async function waitForManualEmailOtp(task: K12Task, email: EmailRecord, label: s
       reject(new Error(`${label} 验证码等待超时`));
     }, MANUAL_OTP_TIMEOUT_MS);
 
-    manualOtpWaiters.set(task.id, {
+    tenantState().manualOtpWaiters.set(task.id, {
       expiresAt: Date.now() + MANUAL_OTP_TIMEOUT_MS,
       resolve: (code: string) => {
         clearTimeout(timer);
@@ -1626,36 +1760,36 @@ function submitManualEmailOtp(taskId: string, code: string): {ok: boolean; messa
   if (!/^\d{6}$/.test(normalized)) {
     throw new Error("验证码必须是 6 位数字");
   }
-  const waiter = manualOtpWaiters.get(taskId);
-  const task = tasks.find((item) => item.id === taskId);
+  const waiter = tenantState().manualOtpWaiters.get(taskId);
+  const task = tenantState().tasks.find((item) => item.id === taskId);
   if (!waiter || !task?.waitingOtp) {
     throw new Error("当前任务没有等待手动验证码");
   }
-  manualOtpWaiters.delete(taskId);
+  tenantState().manualOtpWaiters.delete(taskId);
   waiter.resolve(normalized);
   return {ok: true, message: "验证码已提交"};
 }
 
 function cancelManualEmailOtp(taskId: string, reason: string): void {
-  const waiter = manualOtpWaiters.get(taskId);
+  const waiter = tenantState().manualOtpWaiters.get(taskId);
   if (!waiter) return;
-  manualOtpWaiters.delete(taskId);
+  tenantState().manualOtpWaiters.delete(taskId);
   waiter.reject(new Error(reason));
 }
 
 async function persistEmails(): Promise<void> {
-  await writeJson(emailsFile, emails);
+  await writeJson(tenantState().emailsFile, tenantState().emails);
 }
 
 async function persistTasks(): Promise<void> {
-  await writeJson(tasksFile, tasks);
+  await writeJson(tenantState().tasksFile, tenantState().tasks);
 }
 
 async function persistSub2ApiRefillHistory(): Promise<void> {
-  await writeJson(sub2apiRefillHistoryFile, sub2apiRefillHistory.slice(0, 200));
+  await writeJson(tenantState().sub2apiRefillHistoryFile, tenantState().sub2apiRefillHistory.slice(0, 200));
 }
 
-function hasRunningOrQueuedTasks(items = tasks): boolean {
+function hasRunningOrQueuedTasks(items = tenantState().tasks): boolean {
   return items.some((task) => task.status === "queued" || task.status === "running");
 }
 
@@ -1757,7 +1891,7 @@ function normalizeImportedTask(value: unknown): K12Task | null {
     runWorkspaceJoin: asBoolean(record.runWorkspaceJoin, true),
     runSub2Api: asBoolean(record.runSub2Api, true),
     sub2apiNoRtMode: asBoolean(record.sub2apiNoRtMode, false),
-    sub2apiGroupName: asString(record.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12",
+    sub2apiGroupName: asString(record.sub2apiGroupName, tenantState().appConfig.sub2apiGroupName) || "k12",
     createdAt: asString(record.createdAt) || nowIso(),
     updatedAt: asString(record.updatedAt) || nowIso(),
     startedAt: asString(record.startedAt) || undefined,
@@ -1786,11 +1920,11 @@ async function buildDataExport(): Promise<Record<string, unknown>> {
     app: "gpt-k12",
     version: 1,
     exportedAt: nowIso(),
-    config: appConfig,
-    emails,
-    tasks,
-    tokenOutFileName: path.basename(appConfig.tokenOut || "pool_tokens.txt"),
-    tokenOut: await readFile(appConfig.tokenOut, "utf8").catch(() => ""),
+    config: tenantState().appConfig,
+    emails: tenantState().emails,
+    tasks: tenantState().tasks,
+    tokenOutFileName: path.basename(tenantState().appConfig.tokenOut || "pool_tokens.txt"),
+    tokenOut: await readFile(tenantState().appConfig.tokenOut, "utf8").catch(() => ""),
     summary: summary(),
   };
 }
@@ -1812,33 +1946,33 @@ async function importDataBundle(bundle: Record<string, unknown>): Promise<{email
   if (hasRunningOrQueuedTasks(importedTasks)) throw new Error("导入包里包含运行中或队列任务，请先清理后再导入");
 
   const importedConfig = bundle.config && typeof bundle.config === "object"
-    ? normalizeConfig({...appConfig, ...bundle.config as Partial<AppConfig>, tokenOut: appConfig.tokenOut})
-    : appConfig;
+    ? normalizeConfig({...tenantState().appConfig, ...bundle.config as Partial<AppConfig>, tokenOut: tenantState().appConfig.tokenOut})
+    : tenantState().appConfig;
   const backupFile = await backupCurrentDataBeforeImport();
 
-  appConfig = importedConfig;
-  emails = importedEmails;
-  tasks = importedTasks;
-  activeWorkers = 0;
+  tenantState().appConfig = importedConfig;
+  tenantState().emails = importedEmails;
+  tenantState().tasks = importedTasks;
+  tenantState().activeWorkers = 0;
 
   await Promise.all([
-    saveConfig(appConfig),
+    saveConfig(tenantState().appConfig),
     persistEmails(),
     persistTasks(),
   ]);
 
   const tokenText = typeof bundle.tokenOut === "string" ? bundle.tokenOut : "";
   if (tokenText) {
-    await mkdir(path.dirname(appConfig.tokenOut), {recursive: true});
-    await writeFile(appConfig.tokenOut, tokenText, "utf8");
+    await mkdir(path.dirname(tenantState().appConfig.tokenOut), {recursive: true});
+    await writeFile(tenantState().appConfig.tokenOut, tokenText, "utf8");
   }
 
-  return {emails: emails.length, tasks: tasks.length, tokenOut: Boolean(tokenText), backupFile};
+  return {emails: tenantState().emails.length, tasks: tenantState().tasks.length, tokenOut: Boolean(tokenText), backupFile};
 }
 
 async function importEmails(
   text: string,
-  config = appConfig,
+  config = tenantState().appConfig,
   options: {otpMode?: EmailOtpMode} = {},
 ): Promise<{added: number; updated: number; skipped: number; invalid: number; inputLines: number; total: number; invalidSamples: string[]}> {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -1847,7 +1981,7 @@ async function importEmails(
   let skipped = 0;
   let invalid = 0;
   const invalidSamples: string[] = [];
-  const byEmail = new Map(emails.map((item) => [item.email.toLowerCase(), item]));
+  const byEmail = new Map(tenantState().emails.map((item) => [item.email.toLowerCase(), item]));
   const seenInBatch = new Set<string>();
 
   for (const line of lines) {
@@ -1895,17 +2029,17 @@ async function importEmails(
         importedAt: nowIso(),
         updatedAt: nowIso(),
       };
-      emails.push(record);
+      tenantState().emails.push(record);
       byEmail.set(key, record);
       added += 1;
     }
   }
   await persistEmails();
-  return {added, updated, skipped, invalid, inputLines: lines.length, total: emails.length, invalidSamples};
+  return {added, updated, skipped, invalid, inputLines: lines.length, total: tenantState().emails.length, invalidSamples};
 }
 
 function hasActiveTask(emailId: string): boolean {
-  return tasks.some((task) => task.emailId === emailId && (task.status === "queued" || task.status === "running"));
+  return tenantState().tasks.some((task) => task.emailId === emailId && (task.status === "queued" || task.status === "running"));
 }
 
 function removeEmails(ids: string[]): {removed: number; skippedRunning: number; missing: number} {
@@ -1915,12 +2049,12 @@ function removeEmails(ids: string[]): {removed: number; skippedRunning: number; 
   let removed = 0;
   let skippedRunning = 0;
   let missing = 0;
-  const existingIds = new Set(emails.map((item) => item.id));
+  const existingIds = new Set(tenantState().emails.map((item) => item.id));
   for (const id of requested) {
     if (!existingIds.has(id)) missing += 1;
   }
 
-  emails = emails.filter((email) => {
+  tenantState().emails = tenantState().emails.filter((email) => {
     if (!requested.has(email.id)) return true;
     if (email.status === "running" || hasActiveTask(email.id)) {
       skippedRunning += 1;
@@ -1938,7 +2072,7 @@ function rootMailboxIdentity(email: EmailRecord): string {
 }
 
 function rootMailboxIdentityByEmailId(emailId: string): string {
-  const email = emails.find((item) => item.id === emailId);
+  const email = tenantState().emails.find((item) => item.id === emailId);
   return email ? rootMailboxIdentity(email) : emailId;
 }
 
@@ -1960,12 +2094,12 @@ function buildPlusAlias(email: string, suffix: string): string {
 
 function splitEmails(ids: string[], perParent: number): {created: number; skipped: number; items: Array<{parentEmail: string; email: string}>} {
   const requested = new Set(ids.filter(Boolean));
-  const byEmail = new Set(emails.map((item) => item.email.toLowerCase()));
+  const byEmail = new Set(tenantState().emails.map((item) => item.email.toLowerCase()));
   const processedParents = new Set<string>();
   const createdItems: Array<{parentEmail: string; email: string}> = [];
   let skipped = 0;
 
-  for (const parent of emails.filter((item) => requested.has(item.id))) {
+  for (const parent of tenantState().emails.filter((item) => requested.has(item.id))) {
     const parentEmail = rootMailboxIdentity(parent);
     if (processedParents.has(parentEmail)) {
       skipped += 1;
@@ -2001,7 +2135,7 @@ function splitEmails(ids: string[], perParent: number): {created: number; skippe
         importedAt: nowIso(),
         updatedAt: nowIso(),
       };
-      emails.push(record);
+      tenantState().emails.push(record);
       byEmail.add(alias.toLowerCase());
       createdItems.push({parentEmail, email: alias});
     }
@@ -2012,11 +2146,13 @@ function splitEmails(ids: string[], perParent: number): {created: number; skippe
 
 async function loadBundleModules() {
   await ensureCompatBundleConfig();
-  const srcDir = path.join(appConfig.referenceBundlePath, "codex_register", "src");
-  const openaiPath = pathToFileURL(path.join(srcDir, "openai.ts")).href;
-  const devicePath = pathToFileURL(path.join(srcDir, "device-profile.ts")).href;
-  const sub2ApiPath = pathToFileURL(path.join(srcDir, "sub2api.ts")).href;
-  const mailboxPath = pathToFileURL(path.join(srcDir, "mailbox-url.ts")).href;
+  process.env.K12_COMPAT_CONFIG_FILE = tenantState().compatConfigFile;
+  const srcDir = path.join(tenantState().appConfig.referenceBundlePath, "codex_register", "src");
+  const version = "tenant=" + encodeURIComponent(tenantState().id) + "&mtime=" + Date.now();
+  const openaiPath = pathToFileURL(path.join(srcDir, "openai.ts")).href + "?" + version;
+  const devicePath = pathToFileURL(path.join(srcDir, "device-profile.ts")).href + "?" + version;
+  const sub2ApiPath = pathToFileURL(path.join(srcDir, "sub2api.ts")).href + "?" + version;
+  const mailboxPath = pathToFileURL(path.join(srcDir, "mailbox-url.ts")).href + "?" + version;
   const [openai, device, sub2api, mailbox] = await Promise.all([
     import(openaiPath),
     import(devicePath),
@@ -2029,6 +2165,14 @@ async function loadBundleModules() {
     Sub2ApiClient: sub2api.Sub2ApiClient,
     MailboxUrlCodeProvider: mailbox.MailboxUrlCodeProvider,
   };
+}
+
+async function withCompatConfig<T>(fn: () => Promise<T> | T): Promise<T> {
+  const tenant = tenantState();
+  await ensureCompatBundleConfig();
+  const srcDir = path.join(tenant.appConfig.referenceBundlePath, "codex_register", "src");
+  const {withAppConfigFile} = await import(pathToFileURL(path.join(srcDir, "config.ts")).href);
+  return withAppConfigFile(tenant.compatConfigFile, fn);
 }
 
 function assertNotCanceled(task: K12Task): void {
@@ -2117,7 +2261,7 @@ async function sleepForTask(task: K12Task, ms: number): Promise<void> {
 
 async function sendK12Invite(task: K12Task, client: any, accessToken: string, workspaceId: string, route: K12Route): Promise<K12WorkspaceResult> {
   let last: K12WorkspaceResult | null = null;
-  for (let attempt = 1; attempt <= appConfig.joinMaxRetries + 1; attempt += 1) {
+  for (let attempt = 1; attempt <= tenantState().appConfig.joinMaxRetries + 1; attempt += 1) {
     assertNotCanceled(task);
     const url = `https://chatgpt.com/backend-api/accounts/${encodeURIComponent(workspaceId)}/invites/${route}`;
     appendLog(task, "info", `K12 ${route}: POST ${workspaceId.slice(0, 8)}... 第 ${attempt} 次`);
@@ -2154,13 +2298,13 @@ async function sendK12Invite(task: K12Task, client: any, accessToken: string, wo
       last = {workspaceId, route, ok: false, status: 0, body: error instanceof Error ? error.message : String(error), attempt};
       appendLog(task, "warn", `K12 ${workspaceId.slice(0, 8)}... 网络错误: ${last.body}`);
     }
-    if (attempt <= appConfig.joinMaxRetries) await sleep(appConfig.joinIntervalMs * attempt);
+    if (attempt <= tenantState().appConfig.joinMaxRetries) await sleep(tenantState().appConfig.joinIntervalMs * attempt);
   }
   return last || {workspaceId, route, ok: false, status: 0, body: "未执行", attempt: 0};
 }
 
 async function appendTokenOut(token: string): Promise<void> {
-  const filePath = appConfig.tokenOut;
+  const filePath = tenantState().appConfig.tokenOut;
   if (!filePath || !token) return;
   await mkdir(path.dirname(filePath), {recursive: true});
   const existing = await readFile(filePath, "utf8").catch(() => "");
@@ -2169,7 +2313,7 @@ async function appendTokenOut(token: string): Promise<void> {
 }
 
 async function hydrateTaskAccessTokensFromTokenOut(): Promise<boolean> {
-  const filePath = appConfig.tokenOut;
+  const filePath = tenantState().appConfig.tokenOut;
   if (!filePath) return false;
   const raw = await readFile(filePath, "utf8").catch(() => "");
   const tokens = raw
@@ -2182,7 +2326,7 @@ async function hydrateTaskAccessTokensFromTokenOut(): Promise<boolean> {
   for (const token of tokens) {
     const info = summarizeToken(token);
     if (!info.hash) continue;
-    for (const task of tasks) {
+    for (const task of tenantState().tasks) {
       if (task.accessToken) continue;
       if (task.accessTokenHash && task.accessTokenHash === info.hash) {
         task.accessToken = token;
@@ -2352,7 +2496,7 @@ async function completeAboutYou(client: any, task?: K12Task): Promise<string> {
 }
 
 async function selectAuthWorkspace(client: any, task?: K12Task, referer = AUTH_WORKSPACE_URL): Promise<string> {
-  const workspaceIds = task ? targetK12WorkspaceIds(task) : appConfig.workspaceIds;
+  const workspaceIds = task ? targetK12WorkspaceIds(task) : tenantState().appConfig.workspaceIds;
   const candidates = Array.from(new Set([...workspaceIds, "default", "personal"].filter(Boolean)));
   let lastError = "";
 
@@ -2598,7 +2742,7 @@ function markEmailBanned(email: EmailRecord, reason: string, task?: K12Task): vo
   email.status = "banned";
   email.lastError = reason;
   email.updatedAt = nowIso();
-  for (const queuedTask of tasks) {
+  for (const queuedTask of tenantState().tasks) {
     if (queuedTask.emailId !== email.id || queuedTask.id === task?.id || queuedTask.status !== "queued") continue;
     queuedTask.status = "failed";
     queuedTask.error = reason;
@@ -2621,7 +2765,7 @@ function normalizeChatGptUserId(auth: Record<string, unknown>): string {
 }
 
 function targetK12WorkspaceIds(task: K12Task): string[] {
-  return Array.from(new Set((task.workspaceIds.length ? task.workspaceIds : appConfig.workspaceIds)
+  return Array.from(new Set((task.workspaceIds.length ? task.workspaceIds : tenantState().appConfig.workspaceIds)
     .map((item) => item.trim())
     .filter(Boolean)));
 }
@@ -2994,7 +3138,7 @@ function buildSub2ApiCredentialsFromAccessToken(accessToken: string, fallbackEma
   for (const key of Object.keys(credentials)) {
     if (!credentials[key]) delete credentials[key];
   }
-  if (appConfig.requireChatgptAccountId && !credentials.chatgpt_account_id) {
+  if (tenantState().appConfig.requireChatgptAccountId && !credentials.chatgpt_account_id) {
     throw new Error(`AT 中缺少 chatgpt_account_id: ${credentials.email || fallbackEmail || "(unknown)"}`);
   }
   return credentials;
@@ -3095,8 +3239,8 @@ function sanitizeFileToken(value: string, fallback = "account"): string {
 }
 
 function resolveJsonOutDir(): string {
-  const configured = asString(appConfig.jsonOutDir) || defaultJsonOutDir;
-  return path.isAbsolute(configured) ? configured : path.join(rootDir, configured);
+  const configured = asString(tenantState().appConfig.jsonOutDir) || tenantState().defaultJsonOutDir;
+  return resolveTenantOutputPath(configured, tenantState().defaultJsonOutDir);
 }
 
 function buildAccountJsonOutput(
@@ -3105,7 +3249,7 @@ function buildAccountJsonOutput(
   accessToken: string,
   options: {credentials?: Record<string, unknown>; accountName?: string; source?: string} = {},
 ): {format: JsonOutFormat; accountName: string; data: unknown} {
-  const format = normalizeJsonOutFormat(appConfig.jsonOutFormat);
+  const format = normalizeJsonOutFormat(tenantState().appConfig.jsonOutFormat);
   const credentials = options.credentials || {};
   const payload = decodeJwtPayload(accessToken);
   const auth = (payload["https://api.openai.com/auth"] || {}) as Record<string, unknown>;
@@ -3176,8 +3320,8 @@ function buildAccountJsonOutput(
       ? credentials.group_ids.map(normalizePositiveId).filter((id): id is number => Boolean(id))
       : undefined,
     auto_pause_on_expired: true,
-    concurrency: appConfig.sub2apiConcurrency,
-    priority: appConfig.sub2apiAccountPriority,
+    concurrency: tenantState().appConfig.sub2apiConcurrency,
+    priority: tenantState().appConfig.sub2apiAccountPriority,
     rate_multiplier: 1,
     credentials: {
       access_token: accessToken,
@@ -3329,7 +3473,7 @@ function mergeCredentials(existing: Record<string, unknown>, accessToken: string
   return next;
 }
 
-function expectedSub2ApiAccountNames(email: EmailRecord, groupName = appConfig.sub2apiGroupName || "k12"): string[] {
+function expectedSub2ApiAccountNames(email: EmailRecord, groupName = tenantState().appConfig.sub2apiGroupName || "k12"): string[] {
   const primaryGroupName = primarySub2ApiGroupName(groupName);
   return Array.from(new Set([
     asString(email.sub2apiAccount),
@@ -3400,13 +3544,13 @@ async function requestSub2ApiJson(
 }
 
 async function loginSub2ApiAdmin(): Promise<{origin: string; token: string}> {
-  if (!appConfig.sub2apiUrl || !appConfig.sub2apiEmail || !appConfig.sub2apiPassword) {
+  if (!tenantState().appConfig.sub2apiUrl || !tenantState().appConfig.sub2apiEmail || !tenantState().appConfig.sub2apiPassword) {
     throw new Error("Sub2API 配置不完整：地址、账号、密码均不能为空");
   }
-  const origin = normalizeSub2ApiOrigin(appConfig.sub2apiUrl);
+  const origin = normalizeSub2ApiOrigin(tenantState().appConfig.sub2apiUrl);
   const loginData = (await requestSub2ApiJson(origin, "/api/v1/auth/login", {
     method: "POST",
-    body: {email: appConfig.sub2apiEmail, password: appConfig.sub2apiPassword},
+    body: {email: tenantState().appConfig.sub2apiEmail, password: tenantState().appConfig.sub2apiPassword},
   })) as Record<string, unknown>;
   const token = asString(loginData.access_token || loginData.accessToken);
   if (!token) throw new Error("Sub2API 登录响应缺少 access_token");
@@ -3461,7 +3605,7 @@ function formatSub2ApiGroups(groups: Sub2ApiGroupSelection[]): string {
 async function resolveSub2ApiProxy(
   origin: string,
   adminToken: string,
-  preference = appConfig.sub2apiProxyName,
+  preference = tenantState().appConfig.sub2apiProxyName,
 ): Promise<Sub2ApiProxySelection | undefined> {
   const target = asString(preference);
   if (!target) return undefined;
@@ -3731,18 +3875,18 @@ function sub2ApiAccountIsNormal(account: Record<string, unknown>): boolean {
 
 function pendingSub2ApiRefillTaskCount(groupName: string): number {
   const target = primarySub2ApiGroupName(groupName).toLowerCase();
-  return tasks.filter((task) => (
+  return tenantState().tasks.filter((task) => (
     (task.status === "queued" || task.status === "running")
     && task.runSub2Api
-    && primarySub2ApiGroupName(task.sub2apiGroupName || appConfig.sub2apiGroupName).toLowerCase() === target
+    && primarySub2ApiGroupName(task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName).toLowerCase() === target
   )).length;
 }
 
 function availableRefillEmails(): EmailRecord[] {
-  if (appConfig.smsBowerMailEnabled) {
-    return Array.from({length: Math.max(1, appConfig.sub2apiRefillEmailCount)}, (_, index) => ({
-      id: `${appConfig.gmailMailProvider}_available_${index}`,
-      email: `${appConfig.gmailMailProvider}-dynamic-${index}@gmail.com`,
+  if (tenantState().appConfig.smsBowerMailEnabled) {
+    return Array.from({length: Math.max(1, tenantState().appConfig.sub2apiRefillEmailCount)}, (_, index) => ({
+      id: `${tenantState().appConfig.gmailMailProvider}_available_${index}`,
+      email: `${tenantState().appConfig.gmailMailProvider}-dynamic-${index}@gmail.com`,
       password: "",
       mailboxUrl: "",
       raw: "",
@@ -3751,7 +3895,7 @@ function availableRefillEmails(): EmailRecord[] {
       updatedAt: nowIso(),
     }));
   }
-  return emails.filter((email) => email.status === "free" && !hasActiveTask(email.id));
+  return tenantState().emails.filter((email) => email.status === "free" && !hasActiveTask(email.id));
 }
 
 async function mapWithConcurrency<T, R>(
@@ -3773,63 +3917,66 @@ async function mapWithConcurrency<T, R>(
 }
 
 async function appendSub2ApiRefillHistory(entry: Sub2ApiRefillHistoryEntry): Promise<void> {
-  sub2apiRefillHistory.unshift(entry);
-  if (sub2apiRefillHistory.length > 200) sub2apiRefillHistory = sub2apiRefillHistory.slice(0, 200);
+  tenantState().sub2apiRefillHistory.unshift(entry);
+  if (tenantState().sub2apiRefillHistory.length > 200) tenantState().sub2apiRefillHistory = tenantState().sub2apiRefillHistory.slice(0, 200);
   await persistSub2ApiRefillHistory();
 }
 
 function sub2ApiRefillStatus(): Record<string, unknown> {
   return {
-    enabled: appConfig?.sub2apiAutoRefillEnabled === true,
-    running: sub2apiRefillRunning,
-    nextCheckAt: sub2apiRefillNextCheckAt,
-    lastCheckedAt: sub2apiRefillLastCheckedAt,
-    lastError: sub2apiRefillLastError,
-    lastResult: sub2apiRefillLastResult,
-    history: sub2apiRefillHistory.slice(0, 50),
+    enabled: tenantState().appConfig?.sub2apiAutoRefillEnabled === true,
+    running: tenantState().sub2apiRefillRunning,
+    nextCheckAt: tenantState().sub2apiRefillNextCheckAt,
+    lastCheckedAt: tenantState().sub2apiRefillLastCheckedAt,
+    lastError: tenantState().sub2apiRefillLastError,
+    lastResult: tenantState().sub2apiRefillLastResult,
+    history: tenantState().sub2apiRefillHistory.slice(0, 50),
   };
 }
 
 function updateSub2ApiRefillNextCheck(): void {
-  sub2apiRefillNextCheckAt = appConfig?.sub2apiAutoRefillEnabled
-    ? new Date(Date.now() + Math.max(10000, appConfig.sub2apiRefillIntervalMs)).toISOString()
+  tenantState().sub2apiRefillNextCheckAt = tenantState().appConfig?.sub2apiAutoRefillEnabled
+    ? new Date(Date.now() + Math.max(10000, tenantState().appConfig.sub2apiRefillIntervalMs)).toISOString()
     : "";
 }
 
 function configureSub2ApiRefillTimer(): void {
-  if (sub2apiRefillTimer) {
-    clearInterval(sub2apiRefillTimer);
-    sub2apiRefillTimer = undefined;
+  const tenant = tenantState();
+  if (tenant.sub2apiRefillTimer) {
+    clearInterval(tenant.sub2apiRefillTimer);
+    tenant.sub2apiRefillTimer = undefined;
   }
-  if (!appConfig?.sub2apiAutoRefillEnabled) {
-    sub2apiRefillNextCheckAt = "";
+  if (!tenant.appConfig?.sub2apiAutoRefillEnabled) {
+    tenant.sub2apiRefillNextCheckAt = "";
     return;
   }
-  const intervalMs = Math.max(10000, appConfig.sub2apiRefillIntervalMs);
+  const intervalMs = Math.max(10000, tenant.appConfig.sub2apiRefillIntervalMs);
   updateSub2ApiRefillNextCheck();
-  sub2apiRefillTimer = setInterval(() => {
-    updateSub2ApiRefillNextCheck();
-    if (sub2apiRefillRunning) return;
-    void runSub2ApiRefill("timer").catch((error) => {
-      sub2apiRefillLastError = error instanceof Error ? error.message : String(error);
-      console.error(`[sub2api-refill] ${sub2apiRefillLastError}`);
+  tenant.sub2apiRefillTimer = setInterval(() => {
+    void withTenant(tenant, async () => {
+      updateSub2ApiRefillNextCheck();
+      if (tenant.sub2apiRefillRunning) return;
+      await withCompatConfig(() => runSub2ApiRefill("timer")).catch((error) => {
+        tenant.sub2apiRefillLastError = error instanceof Error ? error.message : String(error);
+        console.error(`[sub2api-refill] ${tenant.sub2apiRefillLastError}`);
+      });
     });
   }, intervalMs);
 }
 
 async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefillResult> {
-  if (sub2apiRefillRunning) {
+  if (tenantState().sub2apiRefillRunning) {
     throw new Error("Sub2API 补号检测正在运行，请稍后再试");
   }
-  sub2apiRefillRunning = true;
-  sub2apiRefillLastCheckedAt = nowIso();
-  sub2apiRefillLastError = "";
+  tenantState().sub2apiRefillRunning = true;
+  tenantState().sub2apiRefillLastCheckedAt = nowIso();
+  tenantState().sub2apiRefillLastError = "";
   try {
     await reconcileAndPersistEmailStatuses();
-    const groupName = primarySub2ApiGroupName(appConfig.sub2apiRefillGroupName || appConfig.sub2apiGroupName || "k12");
-    const threshold = Math.max(0, appConfig.sub2apiRefillThreshold);
-    const refillEmailCount = Math.max(1, appConfig.sub2apiRefillEmailCount);
-    const deepCheckEnabled = appConfig.sub2apiRefillDeepCheckEnabled === true;
+    const groupName = primarySub2ApiGroupName(tenantState().appConfig.sub2apiRefillGroupName || tenantState().appConfig.sub2apiGroupName || "k12");
+    const threshold = Math.max(0, tenantState().appConfig.sub2apiRefillThreshold);
+    const refillEmailCount = Math.max(1, tenantState().appConfig.sub2apiRefillEmailCount);
+    const deepCheckEnabled = tenantState().appConfig.sub2apiRefillDeepCheckEnabled === true;
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
     const [group] = await resolveSub2ApiGroups(origin, adminToken, [groupName]);
     if (!group) throw new Error(`Sub2API 未找到补号分组: ${groupName}`);
@@ -3844,7 +3991,7 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
     if (deepCheckEnabled && basicNormalAccounts.length) {
       const deepResults = await mapWithConcurrency(
         basicNormalAccounts,
-        Math.max(1, Math.min(appConfig.sub2apiConcurrency || 1, 5)),
+        Math.max(1, Math.min(tenantState().appConfig.sub2apiConcurrency || 1, 5)),
         async (account) => {
           const accountName = sub2ApiAccountName(account) || "(unnamed)";
           const accountId = sub2ApiAccountId(account);
@@ -3877,11 +4024,11 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
     if (desiredCreate > 0) {
       const created = await createTasks({
         count: desiredCreate,
-        workspaceIds: appConfig.workspaceIds,
-        route: appConfig.route,
-        runWorkspaceJoin: appConfig.runWorkspaceJoin,
+        workspaceIds: tenantState().appConfig.workspaceIds,
+        route: tenantState().appConfig.route,
+        runWorkspaceJoin: tenantState().appConfig.runWorkspaceJoin,
         runSub2Api: true,
-        sub2apiNoRtMode: appConfig.sub2apiNoRtMode,
+        sub2apiNoRtMode: tenantState().appConfig.sub2apiNoRtMode,
         sub2apiGroupName: group.name,
       });
       createdTasks = created.created.length;
@@ -3906,7 +4053,7 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
     }
 
     const result: Sub2ApiRefillResult = {
-      checkedAt: sub2apiRefillLastCheckedAt,
+      checkedAt: tenantState().sub2apiRefillLastCheckedAt,
       source,
       groupName: group.name,
       groupLabel: `${group.name}#${group.id}`,
@@ -3929,7 +4076,7 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
       message,
       samples,
     };
-    sub2apiRefillLastResult = result;
+    tenantState().sub2apiRefillLastResult = result;
     await appendSub2ApiRefillHistory({
       id: `refill_${Date.now()}_${randomUUID().slice(0, 8)}`,
       ok: true,
@@ -3937,23 +4084,23 @@ async function runSub2ApiRefill(source: "manual" | "timer"): Promise<Sub2ApiRefi
     });
     return result;
   } catch (error) {
-    sub2apiRefillLastError = error instanceof Error ? error.message : String(error);
+    tenantState().sub2apiRefillLastError = error instanceof Error ? error.message : String(error);
     await appendSub2ApiRefillHistory({
       id: `refill_${Date.now()}_${randomUUID().slice(0, 8)}`,
-      checkedAt: sub2apiRefillLastCheckedAt || nowIso(),
+      checkedAt: tenantState().sub2apiRefillLastCheckedAt || nowIso(),
       source,
       ok: false,
-      groupName: primarySub2ApiGroupName(appConfig.sub2apiRefillGroupName || appConfig.sub2apiGroupName || "k12"),
-      threshold: Math.max(0, appConfig.sub2apiRefillThreshold),
-      refillEmailCount: Math.max(1, appConfig.sub2apiRefillEmailCount),
-      deepCheckEnabled: appConfig.sub2apiRefillDeepCheckEnabled === true,
-      message: `补号检测失败：${sub2apiRefillLastError}`,
-      error: sub2apiRefillLastError,
-      samples: [sub2apiRefillLastError],
+      groupName: primarySub2ApiGroupName(tenantState().appConfig.sub2apiRefillGroupName || tenantState().appConfig.sub2apiGroupName || "k12"),
+      threshold: Math.max(0, tenantState().appConfig.sub2apiRefillThreshold),
+      refillEmailCount: Math.max(1, tenantState().appConfig.sub2apiRefillEmailCount),
+      deepCheckEnabled: tenantState().appConfig.sub2apiRefillDeepCheckEnabled === true,
+      message: `补号检测失败：${tenantState().sub2apiRefillLastError}`,
+      error: tenantState().sub2apiRefillLastError,
+      samples: [tenantState().sub2apiRefillLastError],
     });
     throw error;
   } finally {
-    sub2apiRefillRunning = false;
+    tenantState().sub2apiRefillRunning = false;
     updateSub2ApiRefillNextCheck();
   }
 }
@@ -4066,10 +4213,10 @@ async function checkSub2ApiAccessTokens(body: Record<string, unknown>): Promise<
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
     : [];
   const requested = new Set(requestedEmailIds);
-  const existingIds = new Set(emails.map((item) => item.id));
+  const existingIds = new Set(tenantState().emails.map((item) => item.id));
   const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
-  const selectedEmails = emails.filter((item) => requested.has(item.id));
-  const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
+  const selectedEmails = tenantState().emails.filter((item) => requested.has(item.id));
+  const sub2apiGroupName = asString(body.sub2apiGroupName, tenantState().appConfig.sub2apiGroupName) || "k12";
   const items: Array<{
     emailId: string;
     email: string;
@@ -4220,11 +4367,11 @@ async function checkTaskAccessTokenWithOptions(
   if (task.status === "queued" || task.status === "running") {
     throw new Error("任务正在运行/排队中，不能测活");
   }
-  const email = emails.find((item) => item.id === task.emailId);
+  const email = tenantState().emails.find((item) => item.id === task.emailId);
   if (!email) throw new Error("邮箱记录不存在");
   if (email.status === "banned") throw new Error("该邮箱已标记封号，不再测活/修复");
 
-  if (!task.accessToken && appConfig.tokenOut) {
+  if (!task.accessToken && tenantState().appConfig.tokenOut) {
     if (await hydrateTaskAccessTokensFromTokenOut()) await persistTasks();
   }
   if (!task.accessToken) {
@@ -4243,7 +4390,7 @@ async function checkTaskAccessTokenWithOptions(
     appendLog(task, "warn", "AT 返回 401，自动创建 AT 修复任务");
     const created = createAtRepairTasks({
       emailIds: [task.emailId],
-      sub2apiGroupName: task.sub2apiGroupName || appConfig.sub2apiGroupName || "k12",
+      sub2apiGroupName: task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName || "k12",
     });
     repairTask = created.created[0];
     if (!repairTask && created.skippedRunning) {
@@ -4292,8 +4439,8 @@ async function checkTaskAccessTokens(body: Record<string, unknown>): Promise<{
   const onlyInactive = asBoolean(body.onlyInactive, false);
   const autoRepair = asBoolean(body.autoRepair, false);
   const candidates = taskIds.length
-    ? tasks.filter((task) => idSet.has(task.id))
-    : tasks.filter((task) => task.status !== "queued" && task.status !== "running" && (task.accessToken || task.accessTokenPreview));
+    ? tenantState().tasks.filter((task) => idSet.has(task.id))
+    : tenantState().tasks.filter((task) => task.status !== "queued" && task.status !== "running" && (task.accessToken || task.accessTokenPreview));
 
   const items: Array<{
     taskId: string;
@@ -4440,8 +4587,8 @@ function buildSub2ApiNoRtCreateBody(
     platform: "openai",
     type: "oauth",
     credentials,
-    concurrency: appConfig.sub2apiConcurrency,
-    priority: appConfig.sub2apiAccountPriority,
+    concurrency: tenantState().appConfig.sub2apiConcurrency,
+    priority: tenantState().appConfig.sub2apiAccountPriority,
     rate_multiplier: 1,
     group_ids: groups.map((group) => group.id),
     auto_pause_on_expired: true,
@@ -4452,7 +4599,7 @@ function buildSub2ApiNoRtCreateBody(
 }
 
 async function createSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: EmailRecord, accessToken: string): Promise<string> {
-  const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || appConfig.sub2apiGroupName);
+  const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
   const {origin, token: adminToken} = await loginSub2ApiAdmin();
   const groups = await resolveSub2ApiGroups(origin, adminToken, groupNames);
   const proxy = await resolveSub2ApiProxy(origin, adminToken);
@@ -4481,7 +4628,7 @@ async function createSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: Ema
 }
 
 async function upsertSub2ApiNoRtAccountFromAccessToken(task: K12Task, email: EmailRecord, accessToken: string): Promise<string> {
-  const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || appConfig.sub2apiGroupName);
+  const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
   const accountName = `${email.email}--noRT`;
   const {origin, token: adminToken} = await loginSub2ApiAdmin();
   const groups = await resolveSub2ApiGroups(origin, adminToken, groupNames);
@@ -4587,7 +4734,7 @@ async function createOpenAIClientForEmail(task: K12Task, email: EmailRecord): Pr
 
   return new OpenAIClient({
     email: email.email,
-    password: appConfig.defaultPassword,
+    password: tenantState().appConfig.defaultPassword,
     deviceProfile: generateRandomDeviceProfile(),
     signupScreenHint: "signup",
     bindEmail: email.email,
@@ -5007,13 +5154,13 @@ async function runK12WorkspaceJoin(client: any, task: K12Task, email: EmailRecor
         await appendTokenOut(latestToken);
       }
     }
-    if (task.workspaceIds.length > 1) await sleep(appConfig.joinIntervalMs);
+    if (task.workspaceIds.length > 1) await sleep(tenantState().appConfig.joinIntervalMs);
   }
   return latestToken;
 }
 
 async function runTask(task: K12Task): Promise<void> {
-  const email = emails.find((item) => item.id === task.emailId);
+  const email = tenantState().emails.find((item) => item.id === task.emailId);
   if (!email) {
     task.status = "failed";
     task.error = "邮箱记录不存在";
@@ -5040,9 +5187,6 @@ async function runTask(task: K12Task): Promise<void> {
   await Promise.all([persistTasks(), persistEmails()]);
 
   try {
-    process.env.OPENAI_PROXY_URL = appConfig.defaultProxyUrl || "direct";
-    process.env.DEFAULT_PROXY_URL = appConfig.defaultProxyUrl || "direct";
-    process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
     await ensureSentinelSdk();
 
     const client = await createOpenAIClientForEmail(task, email);
@@ -5059,7 +5203,7 @@ async function runTask(task: K12Task): Promise<void> {
 
     if (task.runSub2Api) {
       assertNotCanceled(task);
-      if (!appConfig.sub2apiUrl || !appConfig.sub2apiEmail || !appConfig.sub2apiPassword) {
+      if (!tenantState().appConfig.sub2apiUrl || !tenantState().appConfig.sub2apiEmail || !tenantState().appConfig.sub2apiPassword) {
         throw new Error("Sub2API 配置不完整：地址、账号、密码均不能为空");
       }
       if (useNoRtMode) {
@@ -5080,18 +5224,18 @@ async function runTask(task: K12Task): Promise<void> {
       } else {
         try {
           const {Sub2ApiClient} = await loadBundleModules();
-          const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || appConfig.sub2apiGroupName);
+          const groupNames = parseSub2ApiGroupNames(task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
           const primaryGroupName = groupNames[0] || "k12";
-          appendLog(task, "info", `Sub2API OA 授权入库，分组 ${groupNames.join(", ")}${appConfig.sub2apiProxyName ? `，IP管理 ${appConfig.sub2apiProxyName}` : ""}`);
+          appendLog(task, "info", `Sub2API OA 授权入库，分组 ${groupNames.join(", ")}${tenantState().appConfig.sub2apiProxyName ? `，IP管理 ${tenantState().appConfig.sub2apiProxyName}` : ""}`);
           const sub2api = new Sub2ApiClient({
-            url: appConfig.sub2apiUrl,
-            email: appConfig.sub2apiEmail,
-            password: appConfig.sub2apiPassword,
+            url: tenantState().appConfig.sub2apiUrl,
+            email: tenantState().appConfig.sub2apiEmail,
+            password: tenantState().appConfig.sub2apiPassword,
             groupName: primaryGroupName,
             groupNames,
-            proxyName: appConfig.sub2apiProxyName,
-            accountPriority: appConfig.sub2apiAccountPriority,
-            concurrency: appConfig.sub2apiConcurrency,
+            proxyName: tenantState().appConfig.sub2apiProxyName,
+            accountPriority: tenantState().appConfig.sub2apiAccountPriority,
+            concurrency: tenantState().appConfig.sub2apiConcurrency,
           });
           const prepared = await sub2api.prepareOpenAiOAuth();
           appendLog(task, "info", `Sub2API OAuth URL 已生成: ${prepared.groupLabel}`);
@@ -5103,7 +5247,7 @@ async function runTask(task: K12Task): Promise<void> {
             callbackUrl,
             email.email,
             accountName,
-            {requireChatgptAccountId: appConfig.requireChatgptAccountId},
+            {requireChatgptAccountId: tenantState().appConfig.requireChatgptAccountId},
           );
           task.sub2apiAccount = created.accountName;
           email.sub2apiAccount = created.accountName;
@@ -5171,7 +5315,7 @@ async function runTask(task: K12Task): Promise<void> {
     task.finishedAt = nowIso();
     task.updatedAt = nowIso();
     email.updatedAt = nowIso();
-    activeWorkers = Math.max(0, activeWorkers - 1);
+    tenantState().activeWorkers = Math.max(0, tenantState().activeWorkers - 1);
     await Promise.all([persistTasks(), persistEmails()]);
     await enqueueNextSmsBowerFissionTask(email, task).catch((error) => {
       appendLog(task, "warn", `SMSBower Gmail 裂变子任务创建失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -5184,7 +5328,7 @@ async function runTask(task: K12Task): Promise<void> {
 }
 
 async function runAtRepairTask(task: K12Task): Promise<void> {
-  const email = emails.find((item) => item.id === task.emailId);
+  const email = tenantState().emails.find((item) => item.id === task.emailId);
   if (!email) {
     task.status = "failed";
     task.error = "邮箱记录不存在";
@@ -5211,12 +5355,8 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
   await Promise.all([persistTasks(), persistEmails()]);
 
   try {
-    process.env.OPENAI_PROXY_URL = appConfig.defaultProxyUrl || "direct";
-    process.env.DEFAULT_PROXY_URL = appConfig.defaultProxyUrl || "direct";
-    process.env.OPENAI_FETCH_TIMEOUT_MS = String(appConfig.openaiFetchTimeoutMs);
-
     const {origin, token: adminToken} = await loginSub2ApiAdmin();
-    const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || appConfig.sub2apiGroupName);
+    const names = expectedSub2ApiAccountNames(email, task.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName);
     appendLog(task, "info", `按名称查找 Sub2API 账号: ${names.join(" / ")}`);
     const account = await findSub2ApiAccountByName(origin, adminToken, names);
     if (!account) {
@@ -5316,17 +5456,17 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
     task.finishedAt = nowIso();
     task.updatedAt = nowIso();
     email.updatedAt = nowIso();
-    activeWorkers = Math.max(0, activeWorkers - 1);
+    tenantState().activeWorkers = Math.max(0, tenantState().activeWorkers - 1);
     await Promise.all([persistTasks(), persistEmails()]);
     scheduleTasks();
   }
 }
 
 function scheduleTasks(): void {
-  const limit = Math.max(1, appConfig.taskConcurrency);
-  for (const task of tasks) {
+  const limit = Math.max(1, tenantState().appConfig.taskConcurrency);
+  for (const task of tenantState().tasks) {
     if (task.status !== "queued") continue;
-    const email = emails.find((item) => item.id === task.emailId);
+    const email = tenantState().emails.find((item) => item.id === task.emailId);
     if (email?.status !== "banned") continue;
     task.status = "failed";
     task.error = email.lastError || "邮箱已标记封号，队列任务跳过";
@@ -5334,22 +5474,23 @@ function scheduleTasks(): void {
     task.updatedAt = nowIso();
     appendLog(task, "error", task.error);
   }
-  while (activeWorkers < limit) {
+  while (tenantState().activeWorkers < limit) {
     const activeRoots = new Set(
-      tasks
+      tenantState().tasks
         .filter((item) => item.status === "running")
         .map((item) => rootMailboxIdentityByEmailId(item.emailId)),
     );
-    const task = tasks.find((item) => (
+    const task = tenantState().tasks.find((item) => (
       item.status === "queued"
       && !item.cancelRequested
-      && emails.find((email) => email.id === item.emailId)?.status !== "banned"
+      && tenantState().emails.find((email) => email.id === item.emailId)?.status !== "banned"
       && !activeRoots.has(rootMailboxIdentityByEmailId(item.emailId))
     ));
     if (!task) break;
     activeRoots.add(rootMailboxIdentityByEmailId(task.emailId));
-    activeWorkers += 1;
-    void (task.kind === "at-repair" ? runAtRepairTask(task) : runTask(task));
+    const tenant = tenantState();
+    tenant.activeWorkers += 1;
+    void withTenant(tenant, () => withCompatConfig(() => (task.kind === "at-repair" ? runAtRepairTask(task) : runTask(task))));
   }
 }
 
@@ -5383,7 +5524,7 @@ function enqueueK12Task(
     workspaceResults: [],
     logs: [],
   };
-  tasks.push(task);
+  tenantState().tasks.push(task);
   email.status = "running";
   email.lastTaskId = task.id;
   return task;
@@ -5394,25 +5535,25 @@ async function createTasks(body: Record<string, unknown>): Promise<{created: K12
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
     : [];
   const requested = new Set(requestedEmailIds);
-  const existingIds = new Set(emails.map((item) => item.id));
+  const existingIds = new Set(tenantState().emails.map((item) => item.id));
   const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
-  const dynamicGmailMode = !requestedEmailIds.length && appConfig.smsBowerMailEnabled;
+  const dynamicGmailMode = !requestedEmailIds.length && tenantState().appConfig.smsBowerMailEnabled;
   let selectedEmails = requestedEmailIds.length
-    ? emails.filter((item) => requested.has(item.id))
-    : emails.filter((item) => item.status === "free");
+    ? tenantState().emails.filter((item) => requested.has(item.id))
+    : tenantState().emails.filter((item) => item.status === "free");
   const defaultLimit = dynamicGmailMode ? 1 : selectedEmails.length || 1;
   const limit = asNumber(body.count, defaultLimit, 1, 500);
   if (dynamicGmailMode) {
-    selectedEmails = appConfig.gmailMailProvider === "emailnator"
+    selectedEmails = tenantState().appConfig.gmailMailProvider === "emailnator"
       ? await createEmailnatorMailRecords(limit)
       : await createSmsBowerMailRecords(limit);
   }
-  const workspaceCandidates = uniqueStringList(parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : appConfig.workspaceIds);
-  const route = body.route === "accept" ? "accept" : appConfig.route;
-  const runSub2Api = asBoolean(body.runSub2Api, appConfig.runSub2Api);
-  const sub2apiNoRtMode = runSub2Api && asBoolean(body.sub2apiNoRtMode, appConfig.sub2apiNoRtMode);
-  const runWorkspaceJoin = sub2apiNoRtMode ? true : asBoolean(body.runWorkspaceJoin, appConfig.runWorkspaceJoin);
-  const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
+  const workspaceCandidates = uniqueStringList(parseStringList(body.workspaceIds).length ? parseStringList(body.workspaceIds) : tenantState().appConfig.workspaceIds);
+  const route = body.route === "accept" ? "accept" : tenantState().appConfig.route;
+  const runSub2Api = asBoolean(body.runSub2Api, tenantState().appConfig.runSub2Api);
+  const sub2apiNoRtMode = runSub2Api && asBoolean(body.sub2apiNoRtMode, tenantState().appConfig.sub2apiNoRtMode);
+  const runWorkspaceJoin = sub2apiNoRtMode ? true : asBoolean(body.runWorkspaceJoin, tenantState().appConfig.runWorkspaceJoin);
+  const sub2apiGroupName = asString(body.sub2apiGroupName, tenantState().appConfig.sub2apiGroupName) || "k12";
   const created: K12Task[] = [];
   let skippedRunning = 0;
 
@@ -5449,10 +5590,10 @@ function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]
     ? body.emailIds.map((item) => String(item)).filter(Boolean)
     : [];
   const requested = new Set(requestedEmailIds);
-  const existingIds = new Set(emails.map((item) => item.id));
+  const existingIds = new Set(tenantState().emails.map((item) => item.id));
   const missing = requestedEmailIds.filter((id) => !existingIds.has(id)).length;
-  const selectedEmails = emails.filter((item) => requested.has(item.id));
-  const sub2apiGroupName = asString(body.sub2apiGroupName, appConfig.sub2apiGroupName) || "k12";
+  const selectedEmails = tenantState().emails.filter((item) => requested.has(item.id));
+  const sub2apiGroupName = asString(body.sub2apiGroupName, tenantState().appConfig.sub2apiGroupName) || "k12";
   const created: K12Task[] = [];
   let skippedRunning = 0;
   let skippedNoAccount = 0;
@@ -5468,8 +5609,8 @@ function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]
       emailId: email.id,
       email: email.email,
       status: "queued",
-      route: appConfig.route,
-      workspaceIds: appConfig.workspaceIds,
+      route: tenantState().appConfig.route,
+      workspaceIds: tenantState().appConfig.workspaceIds,
       runWorkspaceJoin: false,
       runSub2Api: false,
       sub2apiGroupName,
@@ -5479,7 +5620,7 @@ function createAtRepairTasks(body: Record<string, unknown>): {created: K12Task[]
       logs: [],
     };
     appendLog(task, "info", `AT 修复已排队: ${email.email}`);
-    tasks.push(task);
+    tenantState().tasks.push(task);
     email.status = "running";
     email.lastTaskId = task.id;
     email.lastError = "";
@@ -5495,7 +5636,7 @@ function retryTask(source: K12Task): K12Task {
   if (!["failed", "canceled"].includes(source.status)) {
     throw new Error("只能重试失败或已取消的任务");
   }
-  const email = emails.find((item) => item.id === source.emailId);
+  const email = tenantState().emails.find((item) => item.id === source.emailId);
   if (!email) throw new Error("邮箱记录不存在");
   if (email.status === "running") throw new Error("该邮箱当前正在运行，不能重复重试");
   if (email.status === "banned") throw new Error("该邮箱已标记封号，不能重试");
@@ -5511,14 +5652,14 @@ function retryTask(source: K12Task): K12Task {
     runWorkspaceJoin: source.runWorkspaceJoin,
     runSub2Api: source.runSub2Api,
     sub2apiNoRtMode: source.sub2apiNoRtMode === true,
-    sub2apiGroupName: source.sub2apiGroupName || appConfig.sub2apiGroupName || "k12",
+    sub2apiGroupName: source.sub2apiGroupName || tenantState().appConfig.sub2apiGroupName || "k12",
     createdAt: nowIso(),
     updatedAt: nowIso(),
     workspaceResults: [],
     logs: [],
   };
   appendLog(task, "info", `重试任务，来源: ${source.id}`);
-  tasks.push(task);
+  tenantState().tasks.push(task);
   email.status = "running";
   email.lastTaskId = task.id;
   email.lastError = "";
@@ -5528,11 +5669,11 @@ function retryTask(source: K12Task): K12Task {
 }
 
 function clearFailedTasks(): {removed: number} {
-  const failedTasks = tasks.filter((task) => task.status === "failed");
+  const failedTasks = tenantState().tasks.filter((task) => task.status === "failed");
   if (!failedTasks.length) return {removed: 0};
   const removedIds = new Set(failedTasks.map((task) => task.id));
-  tasks = tasks.filter((task) => !removedIds.has(task.id));
-  for (const email of emails) {
+  tenantState().tasks = tenantState().tasks.filter((task) => !removedIds.has(task.id));
+  for (const email of tenantState().emails) {
     if (email.lastTaskId && removedIds.has(email.lastTaskId)) {
       delete email.lastTaskId;
       email.updatedAt = nowIso();
@@ -5552,20 +5693,20 @@ function summary(): Record<string, unknown> {
   const countByStatus = (items: Array<{status: string}>, status: string) => items.filter((item) => item.status === status).length;
   return {
     emails: {
-      total: emails.length,
-      free: countByStatus(emails, "free"),
-      running: countByStatus(emails, "running"),
-      success: countByStatus(emails, "success"),
-      failed: countByStatus(emails, "failed"),
-      banned: countByStatus(emails, "banned"),
+      total: tenantState().emails.length,
+      free: countByStatus(tenantState().emails, "free"),
+      running: countByStatus(tenantState().emails, "running"),
+      success: countByStatus(tenantState().emails, "success"),
+      failed: countByStatus(tenantState().emails, "failed"),
+      banned: countByStatus(tenantState().emails, "banned"),
     },
     tasks: {
-      total: tasks.length,
-      queued: countByStatus(tasks, "queued"),
-      running: countByStatus(tasks, "running"),
-      success: countByStatus(tasks, "success"),
-      failed: countByStatus(tasks, "failed"),
-      canceled: countByStatus(tasks, "canceled"),
+      total: tenantState().tasks.length,
+      queued: countByStatus(tenantState().tasks, "queued"),
+      running: countByStatus(tenantState().tasks, "running"),
+      success: countByStatus(tenantState().tasks, "success"),
+      failed: countByStatus(tenantState().tasks, "failed"),
+      canceled: countByStatus(tenantState().tasks, "canceled"),
     },
     config: publicConfig(),
   };
@@ -5573,9 +5714,9 @@ function summary(): Record<string, unknown> {
 
 function reconcileEmailStatusesFromTasks(): boolean {
   let changed = false;
-  for (const email of emails) {
+  for (const email of tenantState().emails) {
     if (email.status === "banned") continue;
-    const related = tasks
+    const related = tenantState().tasks
       .filter((task) => task.emailId === email.id)
       .sort((a, b) => String(b.finishedAt || b.updatedAt || b.createdAt).localeCompare(String(a.finishedAt || a.updatedAt || a.createdAt)));
     const latestActive = related.find((task) => task.status === "queued" || task.status === "running");
@@ -5727,7 +5868,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   if (method === "GET" && pathname === "/api/health") {
     await reconcileAndPersistEmailStatuses();
-    sendJson(res, 200, {ok: true, rootDir, dataDir, summary: summary()});
+    sendJson(res, 200, {ok: true, rootDir, dataDir, tenantId: tenantState().id, tenantDir: tenantState().dir, summary: summary()});
     return;
   }
 
@@ -5749,13 +5890,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   if (method === "GET" && pathname === "/api/sub2api/refill/history") {
     const limit = asNumber(url.searchParams.get("limit"), 100, 1, 200);
-    sendJson(res, 200, {items: sub2apiRefillHistory.slice(0, limit), count: sub2apiRefillHistory.length});
+    sendJson(res, 200, {items: tenantState().sub2apiRefillHistory.slice(0, limit), count: tenantState().sub2apiRefillHistory.length});
     return;
   }
 
   if (method === "POST" && pathname === "/api/sub2api/refill/start") {
     try {
-      const result = await runSub2ApiRefill("manual");
+      const result = await withCompatConfig(() => runSub2ApiRefill("manual"));
       sendJson(res, 200, {result, status: sub2ApiRefillStatus(), summary: summary()});
     } catch (error) {
       sendJson(res, 409, {error: error instanceof Error ? error.message : String(error), status: sub2ApiRefillStatus()});
@@ -5793,11 +5934,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   if ((method === "PATCH" || method === "POST") && pathname === "/api/config") {
     const body = await readJsonBody(req);
     const merged = normalizeConfig({
-      ...appConfig,
+      ...tenantState().appConfig,
       ...body,
-      defaultPassword: asString(body.defaultPassword) || appConfig.defaultPassword,
-      sub2apiPassword: asString(body.sub2apiPassword) || appConfig.sub2apiPassword,
-      smsBowerApiKey: asString(body.smsBowerApiKey) || appConfig.smsBowerApiKey,
+      defaultPassword: asString(body.defaultPassword) || tenantState().appConfig.defaultPassword,
+      sub2apiPassword: asString(body.sub2apiPassword) || tenantState().appConfig.sub2apiPassword,
+      smsBowerApiKey: asString(body.smsBowerApiKey) || tenantState().appConfig.smsBowerApiKey,
     });
     await saveConfig(merged);
     sendJson(res, 200, {config: publicConfig()});
@@ -5806,17 +5947,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   if (method === "GET" && pathname === "/api/emails") {
     await reconcileAndPersistEmailStatuses();
-    sendJson(res, 200, {items: emails.map(publicEmail), count: emails.length});
+    sendJson(res, 200, {items: tenantState().emails.map(publicEmail), count: tenantState().emails.length});
     return;
   }
 
   if (method === "POST" && pathname === "/api/emails/import") {
     const body = await readJsonBody(req);
     if (asString(body.mailApiBaseUrl)) {
-      await saveConfig(normalizeConfig({...appConfig, mailApiBaseUrl: asString(body.mailApiBaseUrl)}));
+      await saveConfig(normalizeConfig({...tenantState().appConfig, mailApiBaseUrl: asString(body.mailApiBaseUrl)}));
     }
     const otpMode: EmailOtpMode = body.otpMode === "manual" ? "manual" : "auto";
-    const result = await importEmails(String(body.text || ""), appConfig, {otpMode});
+    const result = await importEmails(String(body.text || ""), tenantState().appConfig, {otpMode});
     sendJson(res, 200, result);
     return;
   }
@@ -5831,7 +5972,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         sendJson(res, 400, {error: "status 只能是 free、failed、success 或 banned"});
         return;
       }
-      ids = emails.filter((item) => item.status === status).map((item) => item.id);
+      ids = tenantState().emails.filter((item) => item.status === status).map((item) => item.id);
     }
     const result = removeEmails(ids);
     await persistEmails();
@@ -5849,7 +5990,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     }
     const result = splitEmails(ids, count);
     await persistEmails();
-    sendJson(res, 200, {...result, total: emails.length});
+    sendJson(res, 200, {...result, total: tenantState().emails.length});
     return;
   }
 
@@ -5874,22 +6015,22 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   if (method === "GET" && pathname === "/api/tasks") {
     if (await hydrateTaskAccessTokensFromTokenOut()) await persistTasks();
-    sendJson(res, 200, {items: tasks.map(publicTask).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))), count: tasks.length});
+    sendJson(res, 200, {items: tenantState().tasks.map(publicTask).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))), count: tenantState().tasks.length});
     return;
   }
 
   if (method === "POST" && pathname === "/api/tasks") {
     const body = await readJsonBody(req);
     if (body.concurrency !== undefined) {
-      await saveConfig(normalizeConfig({...appConfig, taskConcurrency: asNumber(body.concurrency, appConfig.taskConcurrency, 1, 10)}));
+      await saveConfig(normalizeConfig({...tenantState().appConfig, taskConcurrency: asNumber(body.concurrency, tenantState().appConfig.taskConcurrency, 1, 10)}));
     }
     const result = await createTasks(body);
     sendJson(res, 201, {
       tasks: result.created.map(publicTask),
       skippedRunning: result.skippedRunning,
       missing: result.missing,
-      smsBowerMailEnabled: appConfig.smsBowerMailEnabled,
-      gmailMailProvider: appConfig.gmailMailProvider,
+      smsBowerMailEnabled: tenantState().appConfig.smsBowerMailEnabled,
+      gmailMailProvider: tenantState().appConfig.gmailMailProvider,
     });
     return;
   }
@@ -5926,7 +6067,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(cancel|retry|check-at|otp))?$/);
   if (taskMatch) {
-    const task = tasks.find((item) => item.id === decodeURIComponent(taskMatch[1]));
+    const task = tenantState().tasks.find((item) => item.id === decodeURIComponent(taskMatch[1]));
     if (!task) {
       sendJson(res, 404, {error: "task not found"});
       return;
@@ -5982,8 +6123,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         sendJson(res, 409, {error: "只能删除失败或已取消的任务"});
         return;
       }
-      tasks = tasks.filter((item) => item.id !== task.id);
-      const email = emails.find((item) => item.id === task.emailId);
+      tenantState().tasks = tenantState().tasks.filter((item) => item.id !== task.id);
+      const email = tenantState().emails.find((item) => item.id === task.emailId);
       if (email?.lastTaskId === task.id) {
         delete email.lastTaskId;
         email.updatedAt = nowIso();
@@ -6005,7 +6146,8 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     if (url.pathname.startsWith("/api/")) {
-      await handleApi(req, res, url);
+      const tenant = await getTenantRuntime(tenantIdFromRequest(req));
+      await withTenant(tenant, () => handleApi(req, res, url));
       return;
     }
     if (await serveStatic(url, res)) return;
@@ -6016,35 +6158,14 @@ async function handler(req: IncomingMessage, res: ServerResponse): Promise<void>
 }
 
 async function boot(): Promise<void> {
-  await mkdir(dataDir, {recursive: true});
-  appConfig = await loadConfig();
-  await saveConfig(appConfig);
+  await mkdir(tenantsDir, {recursive: true});
+  const defaultTenant = await getTenantRuntime("default");
+  currentTenant = defaultTenant;
   await ensureSentinelSdk();
-  emails = await readJson<EmailRecord[]>(emailsFile, []);
-  tasks = await readJson<K12Task[]>(tasksFile, []);
-  sub2apiRefillHistory = (await readJson<Sub2ApiRefillHistoryEntry[]>(sub2apiRefillHistoryFile, []))
-    .filter((item) => item && typeof item === "object" && asString(item.id) && asString(item.checkedAt))
-    .slice(0, 200);
-  for (const task of tasks) {
-    if (task.status === "running" || task.status === "queued") {
-      task.status = "failed";
-      task.error = "server restarted before task finished";
-      task.finishedAt = nowIso();
-      task.waitingOtp = false;
-      task.waitingOtpLabel = undefined;
-      task.waitingOtpEmail = undefined;
-      task.waitingOtpSince = undefined;
-      appendLog(task, "warn", "服务重启，未完成任务已标记失败");
-    }
-  }
-  await hydrateTaskAccessTokensFromTokenOut();
-  await persistTasks();
-  await reconcileAndPersistEmailStatuses();
-
   createServer((req, res) => {
     void handler(req, res);
-  }).listen(appConfig.port, "0.0.0.0", () => {
-    console.log(`K12 console API listening: http://127.0.0.1:${appConfig.port}/`);
+  }).listen(defaultTenant.appConfig.port, "0.0.0.0", () => {
+    console.log(`K12 console API listening: http://127.0.0.1:${defaultTenant.appConfig.port}/`);
   });
 }
 

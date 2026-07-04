@@ -1,4 +1,5 @@
-import {readFileSync} from "node:fs";
+import {AsyncLocalStorage} from "node:async_hooks";
+import {readFileSync, statSync} from "node:fs";
 import path from "node:path";
 
 export type MailProviderName = "2925" | "gmail" | "proxiedmail" | "cloudflare" | "hotmail" | "gptmail" | "ddg_mail" | "imap_mail";
@@ -38,6 +39,7 @@ interface AppConfigFile {
     ddgImapMailbox?: unknown;
     ddgImapSearchLimit?: unknown;
     defaultProxyUrl?: unknown;
+    openaiFetchTimeoutMs?: unknown;
     smsProvider?: unknown;
     heroSMSApiKey?: unknown;
     heroSMSBaseUrl?: unknown;
@@ -111,6 +113,7 @@ export interface AppConfig {
     ddgImapMailbox: string;
     ddgImapSearchLimit: number;
     defaultProxyUrl: string;
+    openaiFetchTimeoutMs: number;
     smsProvider: SmsProviderName;
     heroSMSApiKey?: string;
     heroSMSBaseUrl: string;
@@ -184,6 +187,7 @@ const DEFAULT_CONFIG: AppConfig = {
     ddgImapMailbox: "INBOX",
     ddgImapSearchLimit: 30,
     defaultProxyUrl: "http://127.0.0.1:10808",
+    openaiFetchTimeoutMs: 45000,
     smsProvider: "hero-sms",
     heroSMSApiKey: undefined,
     heroSMSBaseUrl: "",
@@ -296,8 +300,17 @@ function normalizeBoolean(value: unknown, fallback: boolean): boolean {
     return fallback;
 }
 
-function loadConfig(): AppConfig {
-    const configPath = path.resolve(process.cwd(), "config.json");
+const configFileStorage = new AsyncLocalStorage<string>();
+const configCache = new Map<string, {mtimeMs: number; value: AppConfig}>();
+
+function currentConfigPath(): string {
+    const configured = configFileStorage.getStore() || process.env.K12_COMPAT_CONFIG_FILE;
+    return configured
+        ? path.resolve(configured)
+        : path.resolve(process.cwd(), "config.json");
+}
+
+function loadConfig(configPath = currentConfigPath()): AppConfig {
     let raw: string;
     try {
         raw = readFileSync(configPath, "utf8");
@@ -415,6 +428,7 @@ function loadConfig(): AppConfig {
             typeof parsed.defaultProxyUrl === "string"
                 ? parsed.defaultProxyUrl.trim()
                 : DEFAULT_CONFIG.defaultProxyUrl,
+        openaiFetchTimeoutMs: normalizeNumber(parsed.openaiFetchTimeoutMs, DEFAULT_CONFIG.openaiFetchTimeoutMs),
         smsProvider: normalizeSmsProvider(parsed.smsProvider),
         heroSMSApiKey:
           typeof parsed.heroSMSApiKey === "string"
@@ -533,4 +547,34 @@ function loadConfig(): AppConfig {
     };
 }
 
-export const appConfig = loadConfig();
+function getAppConfig(): AppConfig {
+    const configPath = currentConfigPath();
+    const mtimeMs = statSync(configPath).mtimeMs;
+    const cached = configCache.get(configPath);
+    if (cached && cached.mtimeMs === mtimeMs) return cached.value;
+    const value = loadConfig(configPath);
+    configCache.set(configPath, {mtimeMs, value});
+    return value;
+}
+
+export function withAppConfigFile<T>(configPath: string, fn: () => Promise<T> | T): Promise<T> {
+    return configFileStorage.run(path.resolve(configPath), async () => await fn());
+}
+
+export const appConfig = new Proxy({} as AppConfig, {
+    get(_target, property) {
+        return getAppConfig()[property as keyof AppConfig];
+    },
+    ownKeys() {
+        return Reflect.ownKeys(getAppConfig());
+    },
+    getOwnPropertyDescriptor(_target, property) {
+        const config = getAppConfig();
+        if (!(property in config)) return undefined;
+        return {
+            enumerable: true,
+            configurable: true,
+            value: config[property as keyof AppConfig],
+        };
+    },
+}) as AppConfig;

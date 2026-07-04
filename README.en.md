@@ -45,6 +45,15 @@ Production build:
 npm run build
 ```
 
+## SaaS Multi-User Mode
+
+The web console creates a tenant ID in browser `localStorage` and sends it to the API as `X-K12-Tenant-Id`. The backend isolates config, mailbox pools, tasks, refill history, and JSON output per tenant:
+
+- Default local user: `data/`
+- Browser tenants in production: `data/tenants/<tenantId>/`
+
+Each deployed user can keep their own Sub2API, proxy, mailbox, and task settings instead of sharing one `data/config.json`. Clearing browser data or switching browsers creates a new tenant space.
+
 ## Basic Usage
 
 1. Open the web console.

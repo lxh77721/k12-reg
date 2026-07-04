@@ -14,12 +14,28 @@ export interface EmailCodeProvider {
 
 export const MAILBOX_CONFIG: {
   provider: MailProviderName;
-} = {
-  provider: appConfig.provider,
-};
+} = new Proxy({} as {provider: MailProviderName}, {
+  get(_target, property) {
+    if (property === "provider") return appConfig.provider;
+    return undefined;
+  },
+  ownKeys() {
+    return ["provider"];
+  },
+  getOwnPropertyDescriptor(_target, property) {
+    if (property !== "provider") return undefined;
+    return {
+      enumerable: true,
+      configurable: true,
+      value: appConfig.provider,
+    };
+  },
+});
 
-function createProvider(): EmailCodeProvider {
-  switch (MAILBOX_CONFIG.provider) {
+const providers = new Map<MailProviderName, EmailCodeProvider>();
+
+function createProvider(provider: MailProviderName): EmailCodeProvider {
+  switch (provider) {
     case "proxiedmail":
       return createProxiedMailProvider();
     case "gmail":
@@ -37,16 +53,24 @@ function createProvider(): EmailCodeProvider {
     case "imap_mail":
       return createDdgImapProvider();
     default:
-      throw new Error(`不支持的邮箱 provider: ${MAILBOX_CONFIG.provider}`);
+      throw new Error(`Unsupported mailbox provider: ${provider}`);
   }
 }
 
-const provider = createProvider();
+function getProvider(): EmailCodeProvider {
+  const providerName = appConfig.provider;
+  let provider = providers.get(providerName);
+  if (!provider) {
+    provider = createProvider(providerName);
+    providers.set(providerName, provider);
+  }
+  return provider;
+}
 
 export async function getEmailAddress(): Promise<string> {
-  return provider.getEmailAddress();
+  return getProvider().getEmailAddress();
 }
 
 export async function getEmailVerificationCode(email: string): Promise<string> {
-  return provider.getEmailVerificationCode(email);
+  return getProvider().getEmailVerificationCode(email);
 }
