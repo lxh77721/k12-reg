@@ -1,5 +1,11 @@
 # GPT K12 Console
 
+## Study Group
+
+Scan the QR code to join the study group:
+
+![Study Group](public/qq-study-group.jpg)
+
 A local task console for managing mailbox pools, K12 workspace flows, Sub2API imports, access-token checks/repairs, and account JSON export.
 
 > This project is released as an open-source technical example and local automation tool only. Users are solely responsible for determining whether their use case is lawful, compliant, and allowed by third-party service terms.

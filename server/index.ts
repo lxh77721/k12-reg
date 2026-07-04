@@ -5689,6 +5689,11 @@ function sendText(res: ServerResponse, status: number, body: string, contentType
   res.end(body);
 }
 
+function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
+  res.writeHead(status, {"content-type": contentType});
+  res.end(body);
+}
+
 async function serveStatic(url: URL, res: ServerResponse): Promise<boolean> {
   const distDir = path.join(rootDir, "dist");
   const pathname = url.pathname === "/" ? "/index.html" : url.pathname;
@@ -5697,14 +5702,22 @@ async function serveStatic(url: URL, res: ServerResponse): Promise<boolean> {
   const info = await stat(filePath);
   if (!info.isFile()) return false;
   const ext = path.extname(filePath).toLowerCase();
-  const contentType = ext === ".html"
-    ? "text/html; charset=utf-8"
-    : ext === ".js"
-      ? "text/javascript; charset=utf-8"
-      : ext === ".css"
-        ? "text/css; charset=utf-8"
-        : "application/octet-stream";
-  sendText(res, 200, await readFile(filePath, "utf8"), contentType);
+  const contentType = ({
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml; charset=utf-8",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+  } as Record<string, string>)[ext] || "application/octet-stream";
+  sendBuffer(res, 200, await readFile(filePath), contentType);
   return true;
 }
 

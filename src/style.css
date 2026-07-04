@@ -1262,6 +1262,27 @@ tbody tr:last-child td {
   width: min(1040px, calc(100vw - 48px));
 }
 
+
+.study-group-modal {
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(860px, calc(100vh - 48px));
+}
+
+.study-group-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 0 4px 4px;
+}
+
+.study-group-body img {
+  display: block;
+  width: min(100%, 460px);
+  max-height: calc(100vh - 180px);
+  margin: 0 auto;
+  object-fit: contain;
+  border-radius: 16px;
+  background: #fff;
+}
 .refill-history-modal {
   width: min(1280px, calc(100vw - 48px));
 }
@@ -1643,5 +1664,13 @@ tbody tr:last-child td {
   .modal-card {
     width: calc(100vw - 20px);
     max-height: calc(100vh - 20px);
+  }
+  .study-group-modal {
+    width: calc(100vw - 20px);
+  }
+
+  .study-group-body img {
+    max-height: calc(100vh - 150px);
+    border-radius: 12px;
   }
 }

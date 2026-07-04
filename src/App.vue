@@ -840,12 +840,29 @@
           </div>
         </section>
       </div>
+
+      <div v-if="showStudyGroupModal" class="modal-backdrop" @click.self="closeStudyGroupModal">
+        <section class="panel modal-card study-group-modal" role="dialog" aria-modal="true" aria-labelledby="study-group-title">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">QQ Group</p>
+              <h2 id="study-group-title">学习交流群</h2>
+            </div>
+            <button class="ghost small" @click="closeStudyGroupModal">关闭</button>
+          </div>
+          <div class="study-group-body">
+            <img :src="QQ_STUDY_GROUP_IMAGE" alt="学习交流群二维码" />
+          </div>
+        </section>
+      </div>
     </Teleport>
   </main>
 </template>
 
 <script setup lang="ts">
 import {computed, onMounted, onUnmounted, reactive, ref, watch} from "vue";
+
+const QQ_STUDY_GROUP_IMAGE = "/qq-study-group.jpg";
 
 interface EmailItem {
   id: string;
@@ -1002,6 +1019,7 @@ const showEmailImportModal = ref(false);
 const showEmailPoolModal = ref(false);
 const showTaskLogModal = ref(false);
 const showSub2apiRefillHistoryModal = ref(false);
+const showStudyGroupModal = ref(false);
 let timer: number | undefined;
 let smsBowerAccountTimer: number | undefined;
 
@@ -1908,6 +1926,10 @@ function closeTaskLog() {
   showTaskLogModal.value = false;
 }
 
+function closeStudyGroupModal() {
+  showStudyGroupModal.value = false;
+}
+
 function sampleEmails() {
   emailText.value = emailImportMode.value === "manual"
     ? [
@@ -1952,6 +1974,7 @@ function formatMoney(value: unknown) {
 
 onMounted(async () => {
   await loadConfig();
+  showStudyGroupModal.value = true;
   await Promise.all([refreshAll(), refreshSmsBowerAccountQuietly()]);
   timer = window.setInterval(refreshAll, 2500);
   smsBowerAccountTimer = window.setInterval(refreshSmsBowerAccountQuietly, 60000);
