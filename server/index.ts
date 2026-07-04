@@ -252,6 +252,15 @@ interface WorkspaceCircuitState {
   updatedAt: string;
 }
 
+interface OpenAiAuthCircuitState {
+  failureCount: number;
+  openedUntil?: string;
+  nextAvailableAt?: string;
+  lastStatus?: number;
+  lastError?: string;
+  updatedAt: string;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
@@ -292,6 +301,12 @@ const platformShareDir = asString(process.env.K12_PLATFORM_SHARE_DIR)
   ? path.resolve(asString(process.env.K12_PLATFORM_SHARE_DIR))
   : "";
 const platformShareRatio = asNumber(process.env.K12_PLATFORM_SHARE_RATIO, 5, 2, 1000);
+const OPENAI_AUTH_MIN_INTERVAL_MS = 2500;
+const OPENAI_AUTH_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const OPENAI_AUTH_TRANSIENT_COOLDOWN_MS = 20_000;
+const OPENAI_AUTH_UNSUPPORTED_COUNTRY_COOLDOWN_MS = 30 * 60 * 1000;
+const OPENAI_AUTH_MAX_COOLDOWN_MS = 10 * 60 * 1000;
+const OPENAI_AUTH_MAX_ATTEMPTS = 4;
 
 interface TenantRuntime {
   id: string;
@@ -320,6 +335,9 @@ interface TenantRuntime {
   platformShareQueue?: Promise<PlatformShareCaptureResult>;
   workspaceCircuits: Record<string, WorkspaceCircuitState>;
   workspaceCircuitTimer?: ReturnType<typeof setTimeout>;
+  openAiAuthCircuit: OpenAiAuthCircuitState;
+  openAiAuthCircuitTimer?: ReturnType<typeof setTimeout>;
+  openAiAuthQueue?: Promise<unknown>;
   loaded: boolean;
   loading?: Promise<TenantRuntime>;
 }
@@ -570,6 +588,7 @@ function createTenantRuntime(id: string): TenantRuntime {
     sub2apiRefillLastResult: null,
     platformShareState: defaultPlatformShareState(),
     workspaceCircuits: {},
+    openAiAuthCircuit: {failureCount: 0, updatedAt: nowIso()},
     loaded: false,
   };
 }
@@ -2342,6 +2361,7 @@ function authStepFromError(error: unknown): string {
 function normalizeFlowError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (isOpenAiAccountBannedMessage(message)) return "GPT 账号已被 OpenAI 停用/封禁";
+  if (isOpenAiUnsupportedCountryError(message)) return "OpenAI auth unsupported_country：当前代理/出口国家或地区不可用，请更换支持 OpenAI 的代理出口后重试";
   if (isAddPhoneFlowError(error)) {
     return "登录后触发 add-phone 手机接码页面，按 K12 规则判定失败";
   }
@@ -2353,7 +2373,7 @@ function classifyTaskError(error: unknown): {kind: TaskErrorKind; retryable: boo
   if (/任务已取消/.test(message)) return {kind: "canceled", retryable: false};
   if (isOpenAiAccountBannedMessage(message)) return {kind: "fatal", retryable: false};
   if (
-    /密码错误|invalid_username_or_password|PasswordVerify|domain can request access|Only users with emails on the same domain|add-phone|add-email|缺少 chatgpt_account_id|不是 K12 上下文|未切到 K12|cannot request access/i.test(message)
+    /密码错误|invalid_username_or_password|PasswordVerify|domain can request access|Only users with emails on the same domain|add-phone|add-email|unsupported_country|services are not available in your country|not available in your country|缺少 chatgpt_account_id|不是 K12 上下文|未切到 K12|cannot request access/i.test(message)
   ) {
     return {kind: "fatal", retryable: false};
   }
@@ -2366,7 +2386,7 @@ function classifyTaskError(error: unknown): {kind: TaskErrorKind; retryable: boo
     return {kind: "refreshable", retryable: true};
   }
   if (
-    /HTTP (408|409|425|429|500|502|503|504)|timeout|timed out|超时|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket|network|fetch failed|Internal Server Error|被限流/i.test(message)
+    /HTTP (408|409|425|429|500|502|503|504)|\b(408|409|425|429|500|502|503|504)\b|rate_limit_exceeded|too many requests|timeout|timed out|超时|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket|network|fetch failed|Internal Server Error|被限流|限流/i.test(message)
   ) {
     return {kind: "transient", retryable: true};
   }
@@ -2448,6 +2468,163 @@ async function sleepForTask(task: K12Task, ms: number): Promise<void> {
     await sleep(Math.min(250, deadline - Date.now()));
   }
   assertNotCanceled(task);
+}
+
+function errorText(value: unknown): string {
+  return value instanceof Error ? value.message : String(value || "");
+}
+
+function isOpenAiUnsupportedCountryError(value: unknown): boolean {
+  return /unsupported_country|services are not available in your country|not available in your country/i.test(errorText(value));
+}
+
+function isOpenAiRateLimitError(value: unknown): boolean {
+  return /(?:HTTP\s*)?429\b|rate_limit_exceeded|too many requests|被限流|限流/i.test(errorText(value));
+}
+
+function isOpenAiAuthTransientError(value: unknown): boolean {
+  const message = errorText(value);
+  return isOpenAiRateLimitError(message)
+    || /(?:HTTP\s*)?(408|409|425|500|502|503|504)\b|timeout|timed out|超时|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket|network|fetch failed|Internal Server Error/i.test(message);
+}
+
+function extractHttpStatus(value: unknown): number | undefined {
+  const match = errorText(value).match(/(?:HTTP\s*)?(\d{3})\b/i);
+  if (!match) return undefined;
+  const status = Number(match[1]);
+  return Number.isFinite(status) ? status : undefined;
+}
+
+function openAiAuthCircuitOpenedUntilMs(): number {
+  const openedUntil = tenantState().openAiAuthCircuit.openedUntil;
+  if (!openedUntil) return 0;
+  const ms = Date.parse(openedUntil);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function openAiAuthCooldownRemainingMs(): number {
+  return Math.max(0, openAiAuthCircuitOpenedUntilMs() - Date.now());
+}
+
+function openAiAuthCircuitMessage(): string {
+  const state = tenantState().openAiAuthCircuit;
+  const remaining = openAiAuthCooldownRemainingMs();
+  if (remaining <= 0) return "";
+  const status = state.lastStatus ? `HTTP ${state.lastStatus}` : "网络/环境错误";
+  return `OpenAI auth 熔断冷却中，剩余 ${Math.ceil(remaining / 1000)}s，最近错误 ${status}: ${state.lastError || "-"}`;
+}
+
+function scheduleOpenAiAuthCircuitWakeup(): void {
+  const tenant = tenantState();
+  if (tenant.openAiAuthCircuitTimer) {
+    clearTimeout(tenant.openAiAuthCircuitTimer);
+    tenant.openAiAuthCircuitTimer = undefined;
+  }
+  const openedUntilMs = openAiAuthCircuitOpenedUntilMs();
+  if (!openedUntilMs || openedUntilMs <= Date.now()) return;
+  tenant.openAiAuthCircuitTimer = setTimeout(() => {
+    void withTenant(tenant, async () => {
+      const state = tenantState().openAiAuthCircuit;
+      const stateOpenedUntilMs = state.openedUntil ? Date.parse(state.openedUntil) : 0;
+      if (stateOpenedUntilMs && stateOpenedUntilMs <= Date.now()) {
+        tenantState().openAiAuthCircuit = {
+          ...state,
+          openedUntil: undefined,
+          updatedAt: nowIso(),
+        };
+      }
+      scheduleTasks();
+    });
+  }, Math.min(Math.max(1000, openedUntilMs - Date.now() + 250), 300_000));
+}
+
+async function waitForOpenAiAuthCircuit(task?: K12Task): Promise<void> {
+  const remaining = openAiAuthCooldownRemainingMs();
+  if (remaining <= 0) return;
+  const message = openAiAuthCircuitMessage();
+  if (task && message) appendLog(task, "warn", message);
+  if (task) await sleepForTask(task, Math.min(remaining, OPENAI_AUTH_MAX_COOLDOWN_MS));
+  else await sleep(Math.min(remaining, OPENAI_AUTH_MAX_COOLDOWN_MS));
+}
+
+async function waitForOpenAiAuthSpacing(task?: K12Task): Promise<void> {
+  const state = tenantState().openAiAuthCircuit;
+  const nextMs = state.nextAvailableAt ? Date.parse(state.nextAvailableAt) : 0;
+  const waitMs = Number.isFinite(nextMs) ? Math.max(0, nextMs - Date.now()) : 0;
+  if (waitMs <= 0) return;
+  if (task && waitMs >= 1000) appendLog(task, "info", `OpenAI auth 节流等待 ${Math.ceil(waitMs / 1000)}s`);
+  if (task) await sleepForTask(task, waitMs);
+  else await sleep(waitMs);
+}
+
+function recordOpenAiAuthSuccess(): void {
+  tenantState().openAiAuthCircuit = {
+    failureCount: 0,
+    nextAvailableAt: new Date(Date.now() + OPENAI_AUTH_MIN_INTERVAL_MS).toISOString(),
+    updatedAt: nowIso(),
+  };
+  scheduleOpenAiAuthCircuitWakeup();
+}
+
+function recordOpenAiAuthFailure(error: unknown, task?: K12Task): void {
+  const state = tenantState().openAiAuthCircuit;
+  const message = normalizeFlowError(error).slice(0, 300);
+  const failureCount = (state.failureCount || 0) + 1;
+  const status = extractHttpStatus(error);
+  let cooldownMs = 0;
+  if (isOpenAiUnsupportedCountryError(error)) {
+    cooldownMs = OPENAI_AUTH_UNSUPPORTED_COUNTRY_COOLDOWN_MS;
+  } else if (isOpenAiRateLimitError(error)) {
+    cooldownMs = Math.min(OPENAI_AUTH_MAX_COOLDOWN_MS, OPENAI_AUTH_RATE_LIMIT_COOLDOWN_MS * Math.max(1, failureCount));
+  } else if (isOpenAiAuthTransientError(error) && failureCount >= 2) {
+    cooldownMs = Math.min(OPENAI_AUTH_MAX_COOLDOWN_MS, OPENAI_AUTH_TRANSIENT_COOLDOWN_MS * Math.max(1, failureCount - 1));
+  }
+  tenantState().openAiAuthCircuit = {
+    failureCount,
+    openedUntil: cooldownMs ? new Date(Date.now() + cooldownMs).toISOString() : state.openedUntil,
+    nextAvailableAt: new Date(Date.now() + OPENAI_AUTH_MIN_INTERVAL_MS).toISOString(),
+    lastStatus: status,
+    lastError: message,
+    updatedAt: nowIso(),
+  };
+  if (cooldownMs && task) {
+    appendLog(task, "warn", `OpenAI auth 连续失败 ${failureCount} 次，冷却 ${Math.ceil(cooldownMs / 1000)}s: ${message}`);
+  }
+  scheduleOpenAiAuthCircuitWakeup();
+}
+
+async function runOpenAiAuthRequest<T>(task: K12Task | undefined, label: string, fn: () => Promise<T>): Promise<T> {
+  const tenant = tenantState();
+  const previous = tenant.openAiAuthQueue || Promise.resolve();
+  const run = previous.catch(() => undefined).then(() => withTenant(tenant, async () => {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= OPENAI_AUTH_MAX_ATTEMPTS; attempt += 1) {
+      if (task) assertNotCanceled(task);
+      await waitForOpenAiAuthCircuit(task);
+      await waitForOpenAiAuthSpacing(task);
+      if (task) appendLog(task, "info", `OpenAI auth 请求: ${label} (${attempt}/${OPENAI_AUTH_MAX_ATTEMPTS})`);
+      try {
+        const result = await fn();
+        recordOpenAiAuthSuccess();
+        return result;
+      } catch (error) {
+        lastError = error;
+        recordOpenAiAuthFailure(error, task);
+        if (task) await persistTasks().catch(() => undefined);
+        if (isOpenAiUnsupportedCountryError(error) || !isOpenAiAuthTransientError(error) || attempt >= OPENAI_AUTH_MAX_ATTEMPTS) {
+          throw error;
+        }
+        const message = normalizeFlowError(error);
+        if (task) appendLog(task, "warn", `OpenAI auth ${label} 临时失败，冷却后自动重试: ${message}`);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError || `${label} failed`));
+  }));
+  const queued = run.catch(() => undefined).finally(() => {
+    if (tenant.openAiAuthQueue === queued) tenant.openAiAuthQueue = undefined;
+  });
+  tenant.openAiAuthQueue = queued;
+  return run;
 }
 
 function workspaceCircuitKey(workspaceId: string): string {
@@ -2712,7 +2889,8 @@ async function ensureChatGptCsrfCookie(client: any): Promise<void> {
   }).catch(() => undefined);
 }
 
-async function sendEmailOtpForLogin(client: any, referer = `${AUTH_BASE_URL}/log-in/password`): Promise<string> {
+async function sendEmailOtpForLogin(client: any, task?: K12Task, referer = `${AUTH_BASE_URL}/log-in/password`): Promise<string> {
+  return runOpenAiAuthRequest(task, "PasswordlessSendOtp", async () => {
   const response = await client.fetch(AUTH_PASSWORDLESS_SEND_OTP_URL, {
     method: "POST",
     headers: oauthBrowserHeaders(client, {
@@ -2732,9 +2910,11 @@ async function sendEmailOtpForLogin(client: any, referer = `${AUTH_BASE_URL}/log
   const payload = (await response.json()) as {continue_url?: string; page?: {payload?: {url?: string}}};
   const nextUrl = String(payload.page?.payload?.url || payload.continue_url || `${AUTH_BASE_URL}/email-verification`);
   return new URL(nextUrl, AUTH_BASE_URL).toString();
+  });
 }
 
-async function sendEmailOtpForSignup(client: any, referer = AUTH_CREATE_ACCOUNT_PASSWORD_URL): Promise<string> {
+async function sendEmailOtpForSignup(client: any, task?: K12Task, referer = AUTH_CREATE_ACCOUNT_PASSWORD_URL): Promise<string> {
+  return runOpenAiAuthRequest(task, "EmailOtpSendSignup", async () => {
   const response = await client.fetch(AUTH_EMAIL_OTP_SEND_URL, {
     method: "GET",
     headers: oauthBrowserHeaders(client, {
@@ -2751,6 +2931,7 @@ async function sendEmailOtpForSignup(client: any, referer = AUTH_CREATE_ACCOUNT_
   }
   const payload = (await response.json()) as {continue_url?: string};
   return String(payload.continue_url || "");
+  });
 }
 
 function randomProfile(): {name: string; birthdate: string} {
@@ -2824,6 +3005,7 @@ async function readAuthJsonResponse(response: Response): Promise<{continue_url?:
 }
 
 async function completeAboutYou(client: any, task?: K12Task): Promise<string> {
+  return runOpenAiAuthRequest(task, "CreateAccount", async () => {
   const profile = randomProfile();
   if (task) appendLog(task, "info", `about-you 创建资料: ${profile.name}, ${profile.birthdate}`);
   const sentinelToken = typeof client.fetchSentinelToken === "function"
@@ -2845,9 +3027,11 @@ async function completeAboutYou(client: any, task?: K12Task): Promise<string> {
   });
   const payload = await readAuthJsonResponse(response);
   return String(payload.page?.payload?.url || payload.continue_url || "");
+  });
 }
 
 async function selectAuthWorkspace(client: any, task?: K12Task, referer = AUTH_WORKSPACE_URL): Promise<string> {
+  return runOpenAiAuthRequest(task, "WorkspaceSelect", async () => {
   const workspaceIds = task ? targetK12WorkspaceIds(task) : tenantState().appConfig.workspaceIds;
   const candidates = Array.from(new Set([...workspaceIds, "default", "personal"].filter(Boolean)));
   let lastError = "";
@@ -2885,9 +3069,11 @@ async function selectAuthWorkspace(client: any, task?: K12Task, referer = AUTH_W
   }
 
   throw new Error(`auth workspace/select 失败: ${lastError || "unknown"}`);
+  });
 }
 
 async function finishChatGptCallback(client: any, callbackUrl: string, task?: K12Task, referer = AUTH_BASE_URL): Promise<void> {
+  return runOpenAiAuthRequest(task, "ChatGPTCallback", async () => {
   const log = (level: LogLevel, message: string) => {
     if (task) appendLog(task, level, message);
   };
@@ -2905,6 +3091,7 @@ async function finishChatGptCallback(client: any, callbackUrl: string, task?: K1
   if (!response.ok) {
     throw new Error(`完成 ChatGPT callback 失败: HTTP ${response.status}`);
   }
+  });
 }
 
 async function continueAuthSteps(
@@ -2924,7 +3111,7 @@ async function continueAuthSteps(
     if (continueUrl === `${AUTH_BASE_URL}/log-in/password`) {
       log("warn", "当前账号进入密码页；按配置不提交密码，尝试改走邮箱验证码登录");
       try {
-        continueUrl = await sendEmailOtpForLogin(client, `${AUTH_BASE_URL}/log-in/password`);
+        continueUrl = await sendEmailOtpForLogin(client, task, `${AUTH_BASE_URL}/log-in/password`);
       } catch (error) {
         throw new Error(
           `账号当前被 OpenAI 判定为密码登录步骤，已按配置尝试邮箱验证码登录，但 OpenAI 未允许发送邮箱验证码；该账号无法仅凭邮箱接码登录。原始错误：${error instanceof Error ? error.message : String(error)}`,
@@ -2941,19 +3128,19 @@ async function continueAuthSteps(
       if (typeof client.registerPassword !== "function") {
         throw new Error("新增账号需要创建密码，但参考 OpenAIClient 未暴露 registerPassword()");
       }
-      continueUrl = await client.registerPassword();
+      continueUrl = await runOpenAiAuthRequest(task, "RegisterPassword", () => client.registerPassword());
       continue;
     }
 
     if (continueUrl === AUTH_EMAIL_OTP_SEND_URL) {
       log("info", "OpenAI 要求发送邮箱验证码");
-      continueUrl = await sendEmailOtpForSignup(client, AUTH_CREATE_ACCOUNT_PASSWORD_URL);
+      continueUrl = await sendEmailOtpForSignup(client, task, AUTH_CREATE_ACCOUNT_PASSWORD_URL);
       continue;
     }
 
     if (continueUrl === `${AUTH_BASE_URL}/email-verification`) {
       log("info", "等待邮箱验证码并提交");
-      continueUrl = await client.emailOtpValidate();
+      continueUrl = await runOpenAiAuthRequest(task, "EmailOtpValidate", () => client.emailOtpValidate());
       continue;
     }
 
@@ -2998,7 +3185,7 @@ async function loginAuthFlowWithEmailOtp(
   task: K12Task | undefined,
   options: {finishChatGptCallback?: boolean; allowConsent?: boolean} = {},
 ): Promise<string> {
-  let continueUrl = await client.authorizeContinue();
+  let continueUrl = await runOpenAiAuthRequest<string>(task, "AuthorizeContinue", async () => String(await client.authorizeContinue()));
   return continueAuthSteps(client, continueUrl, task, options);
 }
 
@@ -3007,7 +3194,7 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
   appendLog(task, "info", `登录 ChatGPT Web session: ${emailAddress}`);
   await ensureChatGptCsrfCookie(client);
   try {
-    await client.authLoginChatGPTWeb();
+    await runOpenAiAuthRequest(task, "ChatGPTWebLogin", () => client.authLoginChatGPTWeb());
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (isInvalidAuthStateError(error)) {
@@ -3041,7 +3228,7 @@ async function loginChatGptWebAndGetAccessToken(client: any, task: K12Task, emai
         }),
       });
       try {
-        await client.authLoginChatGPTWeb();
+        await runOpenAiAuthRequest(task, "ChatGPTWebLoginRetry", () => client.authLoginChatGPTWeb());
       } catch (retryError) {
         if (isInvalidAuthStateError(retryError)) {
           appendLog(task, "warn", "重试后 auth session 仍失效，重新打开 ChatGPT auth 入口后接管流程");
@@ -3214,7 +3401,7 @@ async function checkK12WorkspaceMembership(client: any, task: K12Task, accessTok
 
 async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: string, referer = AUTH_WORKSPACE_URL): Promise<string> {
   appendLog(task, "info", `auth workspace/select(K12): ${workspaceId}`);
-  await client.fetch(AUTH_WORKSPACE_URL, {
+  await runOpenAiAuthRequest<Response>(task, "K12WorkspacePage", () => client.fetch(AUTH_WORKSPACE_URL, {
     method: "GET",
     redirect: "manual",
     headers: oauthBrowserHeaders(client, {
@@ -3223,9 +3410,9 @@ async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: s
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": "same-origin",
     }),
-  }).catch(() => undefined);
+  }) as Promise<Response>).catch(() => undefined);
 
-  const response = await client.fetch(AUTH_WORKSPACE_SELECT_URL, {
+  const response = await runOpenAiAuthRequest<Response>(task, "K12WorkspaceSelect", () => client.fetch(AUTH_WORKSPACE_SELECT_URL, {
     method: "POST",
     headers: oauthBrowserHeaders(client, {
       accept: "application/json",
@@ -3237,7 +3424,7 @@ async function selectK12AuthWorkspace(client: any, task: K12Task, workspaceId: s
       "sec-fetch-site": "same-origin",
     }),
     body: JSON.stringify({workspace_id: workspaceId}),
-  });
+  }) as Promise<Response>);
   const text = await response.text().catch(() => "");
   if (!response.ok) {
     throw new Error(`auth workspace/select(K12) workspace_id=${workspaceId} HTTP ${response.status}: ${text.slice(0, 240)}`);
@@ -3261,7 +3448,7 @@ async function followK12WorkspaceSelection(client: any, task: K12Task, nextUrl: 
     return;
   }
   if (nextUrl.startsWith(`${CHATGPT_BASE_URL}/`)) {
-    const response = await client.fetch(nextUrl, {
+    const response = await runOpenAiAuthRequest<Response>(task, "K12WorkspaceCallback", () => client.fetch(nextUrl, {
       method: "GET",
       redirect: "follow",
       headers: oauthBrowserHeaders(client, {
@@ -3270,7 +3457,7 @@ async function followK12WorkspaceSelection(client: any, task: K12Task, nextUrl: 
         "sec-fetch-mode": "navigate",
         "sec-fetch-site": "same-site",
       }),
-    });
+    }) as Promise<Response>);
     if (!response.ok) throw new Error(`进入 K12 workspace 跳转失败: HTTP ${response.status}`);
     return;
   }
@@ -3317,7 +3504,7 @@ async function openChatGptAuthEntryForWorkspaceSwitch(client: any, task: K12Task
     json: "true",
   });
 
-  const signInResponse = await client.fetch(`${CHATGPT_BASE_URL}/api/auth/signin/openai?${query.toString()}`, {
+  const signInResponse = await runOpenAiAuthRequest<Response>(task, "ChatGptSignInOpenAi", () => client.fetch(`${CHATGPT_BASE_URL}/api/auth/signin/openai?${query.toString()}`, {
     method: "POST",
     redirect: "follow",
     headers: oauthBrowserHeaders(client, {
@@ -3330,7 +3517,7 @@ async function openChatGptAuthEntryForWorkspaceSwitch(client: any, task: K12Task
       "sec-fetch-site": "same-origin",
     }),
     body,
-  });
+  }) as Promise<Response>);
   if (!signInResponse.ok) {
     throw new Error(`刷新 auth 入口失败: HTTP ${signInResponse.status}`);
   }
@@ -3338,7 +3525,7 @@ async function openChatGptAuthEntryForWorkspaceSwitch(client: any, task: K12Task
   const authorizeUrl = String(payload.url || "");
   if (!authorizeUrl) throw new Error(`刷新 auth 入口响应缺少 url: ${JSON.stringify(payload).slice(0, 240)}`);
 
-  const authorizeResponse = await client.fetch(authorizeUrl, {
+  const authorizeResponse = await runOpenAiAuthRequest<Response>(task, "WorkspaceSwitchAuthorize", () => client.fetch(authorizeUrl, {
     method: "GET",
     redirect: "manual",
     headers: oauthBrowserHeaders(client, {
@@ -3348,7 +3535,7 @@ async function openChatGptAuthEntryForWorkspaceSwitch(client: any, task: K12Task
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": "same-site",
     }),
-  });
+  }) as Promise<Response>);
   const location = authorizeResponse.headers.get("location");
   const nextUrl = location ? new URL(location, authorizeUrl).toString() : (authorizeResponse.url || authorizeUrl);
   appendLog(task, "info", `auth 入口刷新后 -> ${safeUrlForLog(nextUrl)}`);
@@ -3382,7 +3569,7 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
       throw new Error(`切换 K12 workspace 需要重新登录，当前停在 ${safeUrlForLog(currentUrl)}`);
     }
     if (currentUrl.startsWith(AUTH_BASE_URL)) {
-      const response = await client.fetch(currentUrl, {
+      const response = await runOpenAiAuthRequest<Response>(task, "WorkspaceSwitchAuthFollow", () => client.fetch(currentUrl, {
         method: "GET",
         redirect: "manual",
         headers: oauthBrowserHeaders(client, {
@@ -3391,7 +3578,7 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
           "sec-fetch-mode": "navigate",
           "sec-fetch-site": "same-site",
         }),
-      });
+      }) as Promise<Response>);
       const location = response.headers.get("location");
       if (location) {
         currentUrl = new URL(location, currentUrl).toString();
@@ -3403,7 +3590,7 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
       }
     }
     if (currentUrl.startsWith(CHATGPT_BASE_URL)) {
-      const response = await client.fetch(currentUrl, {
+      const response = await runOpenAiAuthRequest<Response>(task, "WorkspaceSwitchChatGptFollow", () => client.fetch(currentUrl, {
         method: "GET",
         redirect: "follow",
         headers: oauthBrowserHeaders(client, {
@@ -3412,7 +3599,7 @@ async function runWorkspaceSwitchAuthFlow(client: any, task: K12Task, startUrl: 
           "sec-fetch-mode": "navigate",
           "sec-fetch-site": "same-site",
         }),
-      });
+      }) as Promise<Response>);
       if (!response.ok) throw new Error(`切换 K12 workspace 跳转失败: HTTP ${response.status}`);
       return;
     }
@@ -5421,6 +5608,7 @@ async function submitChooseAccountPayload(
   refererUrl: string,
   task?: K12Task,
 ): Promise<{nextUrl: string; error: string}> {
+  return runOpenAiAuthRequest(task, "ChooseAccountApi", async () => {
   const payloadKey = JSON.stringify(payload);
   const response = await client.fetch(`${AUTH_BASE_URL}/api/accounts/session/select`, {
     method: "POST",
@@ -5441,6 +5629,7 @@ async function submitChooseAccountPayload(
     appendLog(task, result.nextUrl ? "info" : "warn", `choose-account api ${payloadKey} -> ${result.nextUrl || result.error}`);
   }
   return result;
+  });
 }
 
 async function submitChooseAccountForm(
@@ -5449,6 +5638,7 @@ async function submitChooseAccountForm(
   refererUrl: string,
   task?: K12Task,
 ): Promise<{nextUrl: string; error: string}> {
+  return runOpenAiAuthRequest(task, "ChooseAccountForm", async () => {
   const response = await client.fetch(AUTH_CHOOSE_ACCOUNT_URL, {
     method: "POST",
     redirect: "manual",
@@ -5468,11 +5658,12 @@ async function submitChooseAccountForm(
     appendLog(task, result.nextUrl ? "info" : "warn", `choose-account form session_id=${sessionId} -> ${result.nextUrl || result.error}`);
   }
   return result;
+  });
 }
 
 async function restartAuthFromChooseAccount(client: any, task: K12Task | undefined, chooseUrl: string): Promise<string> {
   if (task) appendLog(task, "warn", "choose-account 未匹配到当前邮箱，改走“登录至另一个帐户”重新接码");
-  const response = await client.fetch(`${AUTH_BASE_URL}/log-in-or-create-account`, {
+  const response = await runOpenAiAuthRequest<Response>(task, "RestartAuthFromChooseAccount", () => client.fetch(`${AUTH_BASE_URL}/log-in-or-create-account`, {
     method: "GET",
     redirect: "manual",
     headers: oauthBrowserHeaders(client, {
@@ -5481,7 +5672,7 @@ async function restartAuthFromChooseAccount(client: any, task: K12Task | undefin
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": "same-origin",
     }),
-  });
+  }) as Promise<Response>);
   const location = response.headers.get("location");
   const currentUrl = location ? new URL(location, chooseUrl).toString() : (response.url || `${AUTH_BASE_URL}/log-in-or-create-account`);
   if (currentUrl === `${AUTH_BASE_URL}/log-in-or-create-account` || currentUrl.startsWith(`${AUTH_BASE_URL}/log-in-or-create-account`)) {
@@ -5492,7 +5683,7 @@ async function restartAuthFromChooseAccount(client: any, task: K12Task | undefin
 
 async function chooseCurrentAuthAccount(client: any, task?: K12Task, chooseUrl = AUTH_CHOOSE_ACCOUNT_URL): Promise<string> {
   const expectedEmail = task?.email?.trim().toLowerCase() || "";
-  const pageResp = await client.fetch(chooseUrl, {
+  const pageResp = await runOpenAiAuthRequest<Response>(task, "ChooseAccountPage", () => client.fetch(chooseUrl, {
     method: "GET",
     redirect: "manual",
     headers: oauthBrowserHeaders(client, {
@@ -5502,7 +5693,7 @@ async function chooseCurrentAuthAccount(client: any, task?: K12Task, chooseUrl =
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": "same-origin",
     }),
-  });
+  }) as Promise<Response>);
   const redirected = pageResp.headers.get("location");
   if (redirected) return new URL(redirected, chooseUrl).toString();
   const pageHtml = await pageResp.text().catch(() => "");
@@ -5579,11 +5770,11 @@ async function followToLocalhostCallback(client: any, startUrl: string, task?: K
       currentUrl = await chooseCurrentAuthAccount(client, task, currentUrl);
       continue;
     }
-    const response = await client.fetch(currentUrl, {
+    const response = await runOpenAiAuthRequest<Response>(task, "OAuthFollow", () => client.fetch(currentUrl, {
       method: "GET",
       redirect: "manual",
       headers: oauthBrowserHeaders(client),
-    });
+    }) as Promise<Response>);
     const location = response.headers.get("location");
     if (location) {
       currentUrl = new URL(location, currentUrl).toString();
@@ -5612,7 +5803,7 @@ async function followToLocalhostCallback(client: any, startUrl: string, task?: K
 
 async function continueCodexConsent(client: any, consentUrl: string, task?: K12Task): Promise<string> {
   if (task) appendLog(task, "info", "已到 Codex consent 页，优先选择 K12 workspace");
-  await client.fetch(consentUrl, {
+  await runOpenAiAuthRequest<Response>(task, "CodexConsentPage", () => client.fetch(consentUrl, {
     method: "GET",
     redirect: "manual",
     headers: oauthBrowserHeaders(client, {
@@ -5622,7 +5813,7 @@ async function continueCodexConsent(client: any, consentUrl: string, task?: K12T
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": "same-origin",
     }),
-  }).catch(() => undefined);
+  }) as Promise<Response>).catch(() => undefined);
 
   try {
     const nextUrl = await selectAuthWorkspace(client, task, consentUrl);
@@ -5632,7 +5823,7 @@ async function continueCodexConsent(client: any, consentUrl: string, task?: K12T
   }
 
   if (task) appendLog(task, "info", "Codex consent fallback：直接点击 Continue");
-  const response = await client.fetch(consentUrl, {
+  const response = await runOpenAiAuthRequest<Response>(task, "CodexConsentContinue", () => client.fetch(consentUrl, {
     method: "POST",
     redirect: "manual",
     headers: oauthBrowserHeaders(client, {
@@ -5641,7 +5832,7 @@ async function continueCodexConsent(client: any, consentUrl: string, task?: K12T
       referer: consentUrl,
     }),
     body: "consent=true",
-  });
+  }) as Promise<Response>);
   const location = response.headers.get("location");
   if (location) {
     return new URL(location, consentUrl).toString();
@@ -5656,7 +5847,7 @@ async function continueCodexConsent(client: any, consentUrl: string, task?: K12T
 }
 
 async function loginViaSub2ApiAuthorizeUrl(client: any, authorizeUrl: string, task?: K12Task): Promise<string> {
-  const openResponse = await client.fetch(authorizeUrl, {
+  const openResponse = await runOpenAiAuthRequest<Response>(task, "Sub2ApiOAuthOpen", () => client.fetch(authorizeUrl, {
     redirect: "follow",
     headers: oauthBrowserHeaders(client, {
       "accept-encoding": "gzip, deflate, br",
@@ -5664,7 +5855,7 @@ async function loginViaSub2ApiAuthorizeUrl(client: any, authorizeUrl: string, ta
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": "none",
     }),
-  });
+  }) as Promise<Response>);
   if (!openResponse.ok) {
     throw new Error(`Sub2API OAuth URL 请求失败: HTTP ${openResponse.status}`);
   }
@@ -6054,6 +6245,15 @@ async function runAtRepairTask(task: K12Task): Promise<void> {
 }
 
 function scheduleTasks(): void {
+  const authOpenedUntilMs = openAiAuthCircuitOpenedUntilMs();
+  if (authOpenedUntilMs && authOpenedUntilMs <= Date.now()) {
+    tenantState().openAiAuthCircuit = {
+      ...tenantState().openAiAuthCircuit,
+      openedUntil: undefined,
+      updatedAt: nowIso(),
+    };
+  }
+  scheduleOpenAiAuthCircuitWakeup();
   for (const [key, state] of Object.entries(tenantState().workspaceCircuits)) {
     const openedUntilMs = state.openedUntil ? Date.parse(state.openedUntil) : 0;
     if (openedUntilMs && openedUntilMs <= Date.now()) {
@@ -6061,6 +6261,7 @@ function scheduleTasks(): void {
     }
   }
   scheduleWorkspaceCircuitWakeup();
+  if (openAiAuthCooldownRemainingMs() > 0) return;
   const limit = Math.max(1, tenantState().appConfig.taskConcurrency);
   for (const task of tenantState().tasks) {
     if (task.status !== "queued") continue;
